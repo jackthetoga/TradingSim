@@ -1,0 +1,40 @@
+{
+  "commands": [
+    {
+      "id": "c_365e5e4c367d4_19ba37f1bd9",
+      "name": "BuyAsk100",
+      "script": "lmtprice = ask+.01; shares=100;BUY;"
+    },
+    {
+      "id": "c_dc136a66679b98_19ba3803bce",
+      "name": "SellHalfAskMinus5",
+      "script": "lmtprice = ask-.05; shares = position / 2; SELL;"
+    },
+    {
+      "id": "c_18e191e559a1b8_19ba38163f8",
+      "name": "BuyAsk500",
+      "script": "lmtprice = ask+.01; shares=500;BUY;"
+    },
+    {
+      "id": "c_25a109c2a72078_19ba381aa06",
+      "name": "SellAllAskMinus5",
+      "script": "lmtprice = ask-.05; shares = position; SELL;"
+    },
+    {
+      "id": "c_4c9044e3a184d8_19ba381f526",
+      "name": "SellQtrAskMinus5",
+      "script": "lmtprice = ask-.05; shares = position / 4; SELL;"
+    },
+    {
+      "id": "c_884489c2ebe0d_19ba3825ac7",
+      "name": "SellAllBid",
+      "script": "lmtprice = bid; shares=position; SELL;"
+    },
+    {
+      "id": "c_cf62d6176cf2f8_19ba382ad34",
+      "name": "SellHalfBid",
+      "script": "lmtprice = bid; shares=position/2; SELL;"
+    }
+  ],
+  "version": 1
+}

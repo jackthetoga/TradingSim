@@ -1,0 +1,61 @@
+{
+  "bindings": {
+    "chart": {},
+    "entry": {
+      "Enter": {
+        "args": {},
+        "cmd": "trade.buy"
+      },
+      "Shift+Enter": {
+        "args": {},
+        "cmd": "trade.sell"
+      }
+    },
+    "global": {
+      "Shift+!": {
+        "args": {},
+        "cmd": "das:c_365e5e4c367d4_19ba37f1bd9"
+      },
+      "Shift+%": {
+        "args": {},
+        "cmd": "das:c_18e191e559a1b8_19ba38163f8"
+      },
+      "Shift+A": {
+        "args": {},
+        "cmd": "das:c_884489c2ebe0d_19ba3825ac7"
+      },
+      "Shift+B": {
+        "args": {},
+        "cmd": "trade.buy"
+      },
+      "Shift+C": {
+        "args": {},
+        "cmd": "risk.cancel_all_orders"
+      },
+      "Shift+F": {
+        "args": {},
+        "cmd": "risk.flatten_all"
+      },
+      "Shift+J": {
+        "args": {},
+        "cmd": "das:c_25a109c2a72078_19ba381aa06"
+      },
+      "Shift+K": {
+        "args": {},
+        "cmd": "das:c_dc136a66679b98_19ba3803bce"
+      },
+      "Shift+L": {
+        "args": {},
+        "cmd": "das:c_4c9044e3a184d8_19ba381f526"
+      },
+      "Shift+S": {
+        "args": {},
+        "cmd": "das:c_cf62d6176cf2f8_19ba382ad34"
+      }
+    },
+    "l2": {},
+    "tape": {}
+  },
+  "customCommands": {},
+  "version": 2
+}

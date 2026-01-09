@@ -49,6 +49,7 @@ CONFIGS_DIR = PROJECT_ROOT / "Configs"
 CONFIGS_ALLOWED = {
     "layout": "layout.json",
     "hotkeys": "hotkeys.json",
+    "commands": "commands.json",
 }
 
 
@@ -150,6 +151,7 @@ INDEX_HTML = r"""
 // Disk-backed configs (injected by backend). If null, we fall back to localStorage/defaults.
 const DISK_LAYOUT = __DISK_LAYOUT__;
 const DISK_HOTKEYS = __DISK_HOTKEYS__;
+const DISK_COMMANDS = __DISK_COMMANDS__;
 
 // ---------------- Windowing (drag/resize/popout) ----------------
 function ensureWorkspaceStyles(){
@@ -378,6 +380,27 @@ style.textContent = `
   .hkModal .title { color: var(--muted); font-size: 12px; font-weight: 900; }
   .hkModal .big { margin-top:10px; font-size: 20px; font-weight: 1000; letter-spacing: 0.3px; }
   .hkModal .small { margin-top:10px; color: var(--muted); font-size: 12px; }
+
+  /* Commands (DAS-like scripting) */
+  .cmdWrap { display:grid; grid-template-columns: 280px 1fr; gap: 10px; height: 100%; min-height: 0; }
+  .cmdLeft { display:flex; flex-direction:column; gap:10px; min-height:0; }
+  .cmdRight { display:flex; flex-direction:column; gap:10px; min-height:0; }
+  .cmdList { flex:1 1 auto; min-height:0; overflow:auto; border:1px solid rgba(34,48,69,0.55); border-radius:10px; }
+  .cmdItem { padding:8px 10px; border-bottom:1px solid rgba(34,48,69,0.35); cursor:pointer; }
+  .cmdItem:hover { background: rgba(255,255,255,0.03); }
+  .cmdItem.on { background: rgba(20,48,79,0.55); }
+  .cmdName { font-weight: 900; }
+  .cmdSub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .cmdRow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .cmdTa {
+    flex: 1 1 auto; min-height: 160px; width: 100%; resize: none;
+    background: #0f1723; border: 1px solid var(--grid); color: var(--fg);
+    padding: 10px; border-radius: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+  }
+  .cmdBtns { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .badge { display:inline-flex; align-items:center; padding:2px 8px; border-radius:999px; border:1px solid var(--grid); background: rgba(0,0,0,0.15); color: var(--muted); font-size:12px; font-weight:800; }
 `;
 document.head.appendChild(style);
 
@@ -389,6 +412,7 @@ let loadedStartNs = null;    // snapshot anchor (requested time)
 let isPaused = true;
 let lastTapeTsSeen = null;   // for monotonic tape rendering (prevents "time going backwards" on resume/reconnect)
 let lastTrade = null;        // last trade seen (for initializing live higher-TF candles)
+let sessionStats = { open: null, hi: null, lo: null, pcl: null }; // best-effort quote-like fields
 
 // Cross-tab control sync (popouts): pause/play/load in one tab controls the others.
 const TAB_ID = Math.random().toString(36).slice(2);
@@ -1250,6 +1274,9 @@ function makeEntryHtml(){
         <div class="lbl">Stop</div>
         <input id="entry-stop" class="num" type="number" step="0.01" placeholder="Stop Trigger"/>
 
+        <div class="lbl">Route</div>
+        <input id="entry-route" placeholder="ROUTE (e.g. SMRTL)" />
+
         <div class="lbl">Display</div>
         <input id="entry-display" class="num" type="number" min="0" step="1" value="0" title="0 = show full size"/>
       </div>
@@ -1272,6 +1299,7 @@ function initEntryWindow(){
   const sharesEl = $('entry-shares');
   const lmtEl = $('entry-lmt');
   const stopEl = $('entry-stop');
+  const routeEl = $('entry-route');
   const buyBtn = $('entry-send-buy');
   const sellBtn = $('entry-send-sell');
 
@@ -1328,6 +1356,7 @@ function initEntryWindow(){
     const shares = Number(sharesEl?.value || 0);
     const lmt = lmtEl?.value ? Number(lmtEl.value) : null;
     const stop = stopEl?.value ? Number(stopEl.value) : null;
+    const route = String(routeEl?.value || '').trim();
     const display = Number($('entry-display')?.value || 0);
 
     if (!symbol) { setErr('Entry: missing symbol'); return; }
@@ -1342,6 +1371,7 @@ function initEntryWindow(){
       type: ordType,
       qty: Math.floor(shares),
       limitPx: (ordType === 'LMT') ? Number(lmt) : null,
+      route: route || null,
       display,
     });
   };
@@ -1486,6 +1516,112 @@ let hkRecording = null; // {context, commandId}
 
 function _clone(x){ return JSON.parse(JSON.stringify(x)); }
 
+// ---------------- Commands (DAS-like scripting; saved to Configs/commands.json) ----------------
+const CMD_STORAGE_KEY = 'sim-commands-v1';
+const CMD_DEFAULTS = { version: 1, commands: [] }; // commands: [{id,name,script}]
+let cmdState = null;
+let cmdSelectedId = null;
+
+function _normalizeCmdState(obj){
+  const out = _clone(CMD_DEFAULTS);
+  if (!obj || typeof obj !== 'object') return out;
+  if (Number(obj.version || 0) !== 1) return out;
+  const arr = Array.isArray(obj.commands) ? obj.commands : [];
+  out.commands = arr
+    .filter(x=>x && typeof x === 'object')
+    .map(x=>({ id: String(x.id || ''), name: String(x.name || ''), script: String(x.script || '') }))
+    .filter(x=> x.id && x.name);
+  return out;
+}
+
+function _newCmdId(){
+  return 'c_' + Math.random().toString(16).slice(2) + '_' + Date.now().toString(16);
+}
+
+function loadCommands(){
+  try {
+    if (typeof DISK_COMMANDS !== 'undefined' && DISK_COMMANDS && typeof DISK_COMMANDS === 'object') {
+      return _normalizeCmdState(DISK_COMMANDS);
+    }
+    const raw = localStorage.getItem(CMD_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return _normalizeCmdState(parsed);
+  } catch {
+    return _clone(CMD_DEFAULTS);
+  }
+}
+
+// Initialize command state early so hotkeys/settings can see the catalog even if the Commands window is closed.
+try { cmdState = loadCommands(); } catch { cmdState = _clone(CMD_DEFAULTS); }
+
+function saveCommands(){
+  if (!cmdState) return;
+  try { localStorage.setItem(CMD_STORAGE_KEY, JSON.stringify(cmdState)); } catch {}
+  try { scheduleConfigSave('commands', cmdState); } catch {}
+  // Hotkeys UI includes a command catalog; refresh if it exists.
+  try { renderHotkeys(); } catch {}
+}
+
+function _cmdCatalog(){
+  const cmds = [];
+  try {
+    const arr = cmdState?.commands || [];
+    for (const c of arr){
+      const id = String(c?.id || '');
+      const name = String(c?.name || id);
+      if (!id) continue;
+      cmds.push({ id: `das:${id}`, label: `CMD: ${name}`, contexts: ['global','entry'] });
+    }
+  } catch {}
+  return cmds;
+}
+
+// ---------------- Global variables ($name), persisted to localStorage ----------------
+const GLOBAL_VARS_KEY = 'sim-global-vars-v1';
+let GLOBAL_VARS = null; // {lowerKey: any}
+
+function _normGlobalName(name){
+  const s = String(name || '').trim();
+  if (!s) throw new Error('Global var name is required');
+  const n = s.startsWith('$') ? s.slice(1) : s;
+  if (!n) throw new Error('Global var name is required');
+  return n.toLowerCase();
+}
+
+function _loadGlobalVars(){
+  try {
+    const raw = localStorage.getItem(GLOBAL_VARS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function _saveGlobalVars(){
+  try { localStorage.setItem(GLOBAL_VARS_KEY, JSON.stringify(GLOBAL_VARS || {})); } catch {}
+}
+
+function getGlobalVar(name){
+  if (!GLOBAL_VARS) GLOBAL_VARS = _loadGlobalVars();
+  const k = _normGlobalName(name);
+  return GLOBAL_VARS[k];
+}
+
+function setGlobalVar(name, value){
+  if (!GLOBAL_VARS) GLOBAL_VARS = _loadGlobalVars();
+  const k = _normGlobalName(name);
+  GLOBAL_VARS[k] = value;
+  _saveGlobalVars();
+}
+
+function delGlobalVar(name){
+  if (!GLOBAL_VARS) GLOBAL_VARS = _loadGlobalVars();
+  const k = _normGlobalName(name);
+  delete GLOBAL_VARS[k];
+  _saveGlobalVars();
+}
+
 function _normalizeHotkeysState(obj){
   // Accept:
   // - v1: bindings map {global:{...}, entry:{...}, ...}
@@ -1507,7 +1643,7 @@ function exportHotkeysState(){
 }
 
 function _allCommands(){
-  const cmds = [...BASE_COMMANDS];
+  const cmds = [...BASE_COMMANDS, ..._cmdCatalog()];
   try {
     const cc = hkCustom && typeof hkCustom === 'object' ? hkCustom : {};
     for (const [id, meta] of Object.entries(cc)){
@@ -1603,6 +1739,7 @@ function scheduleConfigSave(name, data){
 function _knownCmd(cmd){
   if (!cmd) return false;
   if (String(cmd).startsWith('custom:')) return true;
+  if (String(cmd).startsWith('das:')) return true;
   return BASE_COMMANDS.some(c=>c.id === cmd);
 }
 
@@ -1626,6 +1763,14 @@ function executeCommand(cmdId, args){
   const id = String(cmdId || '');
   if (id === 'trade.buy') { document.getElementById('entry-send-buy')?.click?.(); return; }
   if (id === 'trade.sell') { document.getElementById('entry-send-sell')?.click?.(); return; }
+  if (id.startsWith('das:')) {
+    const cid = id.slice(4);
+    const c = (cmdState?.commands || []).find(x=>String(x?.id||'') === cid) || null;
+    if (!c) { setErr(`Unknown DAS command: ${id}`); return; }
+    try { runDasScript(String(c.script || ''), { name: String(c.name||cid), id: cid }); }
+    catch (e) { setErr(`Command failed: ${e?.message ?? e}`); }
+    return;
+  }
   if (id === 'risk.cancel_all_orders') {
     const nowNs = (playheadNs ?? loadedStartNs ?? null);
     for (const o of orders.values()){
@@ -1684,6 +1829,292 @@ function executeCommand(cmdId, args){
     return;
   }
   setErr(`Unknown command: ${id}`);
+}
+
+// ---------------- DAS-like script execution (client-side) ----------------
+function _splitStatements(src){
+  const s = String(src || '');
+  const out = [];
+  let buf = '';
+  let depth = 0;
+  for (let i=0;i<s.length;i++){
+    const ch = s[i];
+    if (ch === '(') depth += 1;
+    if (ch === ')') depth = Math.max(0, depth - 1);
+    if ((ch === ';' || ch === ',') && depth === 0){
+      if (buf.trim()) out.push(buf.trim());
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out;
+}
+
+function _tokenizeExpr(src){
+  const s = String(src || '');
+  const toks = [];
+  let i = 0;
+  const isWS = (c)=> /\s/.test(c);
+  const isNumStart = (c)=> (/\d/.test(c) || (c === '.' && i+1 < s.length && /\d/.test(s[i+1])));
+  const isIdStart = (c)=> /[A-Za-z_$]/.test(c);
+  const isIdCont = (c)=> /[A-Za-z0-9_]/.test(c);
+  while (i < s.length){
+    const c = s[i];
+    if (isWS(c)) { i++; continue; }
+    if (c === '(' || c === ')'){ toks.push({k:c, v:c}); i++; continue; }
+    if (c === '+' || c === '-' || c === '*' || c === '/'){ toks.push({k:'op', v:c}); i++; continue; }
+    if (isNumStart(c)){
+      let j = i;
+      while (j < s.length && /[\d.]/.test(s[j])) j++;
+      const txt = s.slice(i, j);
+      const v = Number(txt);
+      if (!Number.isFinite(v)) throw new Error(`Invalid number: ${txt}`);
+      toks.push({k:'num', v});
+      i = j;
+      continue;
+    }
+    if (isIdStart(c)){
+      let j = i+1;
+      while (j < s.length && /[A-Za-z0-9_$]/.test(s[j])) j++;
+      toks.push({k:'id', v: s.slice(i, j)});
+      i = j;
+      continue;
+    }
+    throw new Error(`Unexpected character in expression: '${c}'`);
+  }
+  return toks;
+}
+
+function _evalExpr(expr, envGet){
+  const toks = _tokenizeExpr(expr);
+  const out = [];
+  const ops = [];
+  const prec = {'u+':3,'u-':3,'*':2,'/':2,'+':1,'-':1};
+  const isOpTok = (t)=> t && t.k === 'op';
+  let prev = null;
+  for (const t of toks){
+    if (t.k === 'num' || t.k === 'id') { out.push(t); prev = t; continue; }
+    if (t.k === '(') { ops.push(t); prev = t; continue; }
+    if (t.k === ')'){
+      while (ops.length && ops[ops.length-1].k !== '(') out.push(ops.pop());
+      if (!ops.length) throw new Error('Mismatched parentheses');
+      ops.pop();
+      prev = t;
+      continue;
+    }
+    if (isOpTok(t)){
+      let op = t.v;
+      const unary = (!prev || (prev.k === 'op') || (prev.k === '('));
+      if (unary && (op === '+' || op === '-')) op = (op === '+') ? 'u+' : 'u-';
+      while (ops.length){
+        const top = ops[ops.length-1];
+        if (top.k === '(') break;
+        const topOp = top.v;
+        if ((prec[topOp] ?? 0) >= (prec[op] ?? 0)) out.push(ops.pop());
+        else break;
+      }
+      ops.push({k:'op', v: op});
+      prev = t;
+      continue;
+    }
+    throw new Error('Invalid expression token');
+  }
+  while (ops.length){
+    const top = ops.pop();
+    if (top.k === '(') throw new Error('Mismatched parentheses');
+    out.push(top);
+  }
+  const st = [];
+  for (const t of out){
+    if (t.k === 'num'){ st.push(Number(t.v)); continue; }
+    if (t.k === 'id'){
+      const v = envGet(String(t.v||'').toLowerCase());
+      if (!Number.isFinite(Number(v))) throw new Error(`Variable '${t.v}' is not numeric`);
+      st.push(Number(v));
+      continue;
+    }
+    if (t.k === 'op'){
+      const op = t.v;
+      if (op === 'u+' || op === 'u-'){
+        const a = st.pop();
+        if (!Number.isFinite(a)) throw new Error('Bad unary operand');
+        st.push(op === 'u-' ? -a : +a);
+        continue;
+      }
+      const b = st.pop();
+      const a = st.pop();
+      if (!Number.isFinite(a) || !Number.isFinite(b)) throw new Error('Bad operands');
+      if (op === '+') st.push(a + b);
+      else if (op === '-') st.push(a - b);
+      else if (op === '*') st.push(a * b);
+      else if (op === '/') st.push(a / b);
+      else throw new Error(`Unknown op ${op}`);
+      continue;
+    }
+  }
+  if (st.length !== 1) throw new Error('Invalid expression');
+  return st[0];
+}
+
+function _envSnapshot(){
+  const bidPx = ()=> currentBook?.bids?.[0]?.[0] ?? null;
+  const askPx = ()=> currentBook?.asks?.[0]?.[0] ?? null;
+  const frozenAsk = (askPx() == null ? null : Number(askPx()));
+  const frozenBid = (bidPx() == null ? null : Number(bidPx()));
+  const getTicker = ()=> String(document.getElementById('symbol')?.value?.trim?.() ?? '').toUpperCase();
+  const getPosShares = ()=>{
+    const sym = getTicker();
+    const p = positions.get(sym);
+    return p ? Number(p.shares ?? 0) : 0;
+  };
+  const getCostBasis = ()=>{
+    const sym = getTicker();
+    const p = positions.get(sym);
+    const c = (p && p.avgCost != null) ? Number(p.avgCost) : null;
+    return (c == null || !Number.isFinite(c)) ? null : c;
+  };
+  return {
+    get: (name)=>{
+      const n = String(name||'').toLowerCase();
+      if (n === 'ask') return frozenAsk;
+      if (n === 'bid') return frozenBid;
+      if (n === 'last') return Number(lastTrade?.price ?? null);
+      if (n === 'hi') return (sessionStats?.hi == null) ? null : Number(sessionStats.hi);
+      if (n === 'lo') return (sessionStats?.lo == null) ? null : Number(sessionStats.lo);
+      if (n === 'open') return (sessionStats?.open == null) ? null : Number(sessionStats.open);
+      if (n === 'pcl') return (sessionStats?.pcl == null) ? null : Number(sessionStats.pcl);
+      if (n === 'l2bid') return frozenBid;
+      if (n === 'l2ask') return frozenAsk;
+      if (n === 'ticker') return getTicker();
+      if (n === 'position') return getPosShares();
+      if (n === 'pos') return getPosShares();
+      if (n === 'costbasis') return getCostBasis();
+      if (n === 'shares') return Number(document.getElementById('entry-shares')?.value || 0);
+      if (n === 'share') return Number(document.getElementById('entry-shares')?.value || 0);
+      if (n === 'lmtprice') return Number(document.getElementById('entry-lmt')?.value || 0);
+      if (n === 'price') return Number(document.getElementById('entry-lmt')?.value || 0);
+      if (n === 'stopprice') return Number(document.getElementById('entry-stop')?.value || 0);
+      if (n === 'route') return String(document.getElementById('entry-route')?.value || '');
+      if (n === 'stoptype') return String(document.getElementById('entry-ordtype')?.value || '');
+      // Global vars ($name), case-insensitive
+      if (n.startsWith('$')) return getGlobalVar(n);
+      throw new Error(`Unknown variable: ${name}`);
+    },
+    set: (name, v)=>{
+      const n = String(name||'').toLowerCase();
+      if (n === 'shares') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(1, Math.floor(Number(v)))); return; }
+      if (n === 'share') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(1, Math.floor(Number(v)))); return; }
+      if (n === 'lmtprice') { const el=document.getElementById('entry-lmt'); if (el) el.value=String(Number(v)); return; }
+      if (n === 'price') { const el=document.getElementById('entry-lmt'); if (el) el.value=String(Number(v)); return; }
+      if (n === 'stopprice') { const el=document.getElementById('entry-stop'); if (el) el.value=String(Number(v)); return; }
+      if (n === 'route') { const el=document.getElementById('entry-route'); if (el) el.value=String(v); return; }
+      if (n === 'stoptype') {
+        const el=document.getElementById('entry-ordtype');
+        if (el) {
+          el.value = String(v).toUpperCase();
+          // best-effort: trigger field enable/disable updates
+          try { el.dispatchEvent(new Event('change', {bubbles:true})); } catch {}
+        }
+        return;
+      }
+      if (n.startsWith('$')) { setGlobalVar(n, v); return; }
+      throw new Error(`Variable '${name}' is read-only`);
+    },
+  };
+}
+
+async function validateDasScriptRemote(src){
+  try {
+    const res = await fetch('/api/commands/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: String(src||'') }),
+    });
+    return await res.json();
+  } catch (e) {
+    return { ok:false, errors:[{message: `Validate failed: ${e?.message ?? e}`, line:1, col:1}] };
+  }
+}
+
+function runDasScript(src, meta){
+  const env = _envSnapshot();
+  const parts = _splitStatements(src);
+  for (const st of parts){
+    const s = String(st || '').trim();
+    if (!s) continue;
+    const up = s.toUpperCase();
+    if (up === 'BUY') { document.getElementById('entry-send-buy')?.click?.(); continue; }
+    if (up === 'SELL') { document.getElementById('entry-send-sell')?.click?.(); continue; }
+    if (up === 'CANCELALL' || up === 'CANCEL_ALL' || up === 'CANCELALLORDERS') { executeCommand('risk.cancel_all_orders', {}); continue; }
+
+    // SetVar(name, value) / DelVar(name)
+    if (/^SETVAR\s*\(/i.test(s) || /^DELVAR\s*\(/i.test(s)) {
+      const m = s.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*)\)\s*$/);
+      if (!m) throw new Error(`Invalid call syntax: '${s}'`);
+      const fn = String(m[1]||'').toUpperCase();
+      const argsRaw = String(m[2]||'');
+      // naive split on comma at depth 0 (parens only)
+      const args = [];
+      let buf = '', depth = 0;
+      for (let i=0;i<argsRaw.length;i++){
+        const ch = argsRaw[i];
+        if (ch === '(') depth += 1;
+        if (ch === ')') depth = Math.max(0, depth - 1);
+        if (ch === ',' && depth === 0){
+          args.push(buf.trim()); buf=''; continue;
+        }
+        buf += ch;
+      }
+      if (buf.trim()) args.push(buf.trim());
+      const parseName = (x)=>{
+        const t = String(x||'').trim();
+        const q = t.match(/^["']([\s\S]*)["']$/);
+        return q ? q[1] : t;
+      };
+      if (fn === 'DELVAR'){
+        if (args.length !== 1) throw new Error('DelVar(name) expects 1 argument');
+        delGlobalVar(parseName(args[0]));
+        continue;
+      }
+      if (fn === 'SETVAR'){
+        if (args.length !== 2) throw new Error('SetVar(name, value) expects 2 arguments');
+        const nm = parseName(args[0]);
+        const rhs = String(args[1]||'').trim();
+        const q = rhs.match(/^["']([\s\S]*)["']$/);
+        const val = q ? q[1] : _evalExpr(rhs, (n)=>env.get(n));
+        setGlobalVar(nm, val);
+        continue;
+      }
+    }
+
+    const eq = s.indexOf('=');
+    if (eq < 0) throw new Error(`Expected assignment or command: '${s}'`);
+    const lhs = s.slice(0, eq).trim().toLowerCase();
+    const rhs = s.slice(eq+1).trim();
+    // $globals: allow string literals or numeric expressions
+    if (lhs.startsWith('$')){
+      const q = rhs.match(/^["']([\s\S]*)["']$/);
+      const val = q ? q[1] : _evalExpr(rhs, (n)=>env.get(n));
+      env.set(lhs, val);
+      continue;
+    }
+
+    // string-like assignments (order-entry props)
+    const strWritable = new Set(['route','stoptype']);
+    if (strWritable.has(lhs)){
+      const q = rhs.match(/^["']([\s\S]*)["']$/);
+      env.set(lhs, q ? q[1] : rhs);
+      continue;
+    }
+
+    const writable = new Set(['shares','share','lmtprice','price','stopprice']);
+    if (!writable.has(lhs)) throw new Error(`Variable '${lhs}' is not writable`);
+    const val = _evalExpr(rhs, (n)=>env.get(n));
+    env.set(lhs, val);
+  }
+  setStatus(meta?.name ? `Ran command: ${meta.name}` : 'Ran command');
 }
 
 function handleHotkey(ev){
@@ -2044,6 +2475,175 @@ function initSettingsWindow(){
       setErr(String(err?.message ?? err));
     }
   });
+}
+
+// ---------------- Commands window (DAS-like scripting) ----------------
+function makeCommandsHtml(){
+  return `
+    <div class="cmdWrap">
+      <div class="cmdLeft">
+        <div class="cmdBtns">
+          <button class="wbtn" id="cmdNew">New</button>
+          <button class="wbtn" id="cmdDel">Delete</button>
+          <button class="wbtn" id="cmdSave">Save</button>
+        </div>
+        <div class="cmdList" id="cmdList"></div>
+        <div class="entryHint">
+          Bind via Hotkeys using command id: <span class="badge">das:&lt;id&gt;</span>
+        </div>
+      </div>
+      <div class="cmdRight">
+        <div class="cmdRow">
+          <label class="hint" style="display:flex; gap:6px; align-items:center;">
+            Name <input id="cmdName" placeholder="My DAS Command" style="width:260px;"/>
+          </label>
+          <span class="badge" id="cmdId">(no selection)</span>
+        </div>
+        <textarea class="cmdTa" id="cmdScript" spellcheck="false" placeholder="lmtprice = ask - .10; shares = 5000 / lmtprice; BUY;"></textarea>
+        <div class="cmdBtns">
+          <button class="wbtn" id="cmdCheck">Check</button>
+          <button class="wbtn primary" id="cmdRun">Run</button>
+          <span class="entryHint" id="cmdMsg"></span>
+        </div>
+        <div class="entryHint">
+          Vars: <span class="badge">ask</span> <span class="badge">bid</span> <span class="badge">shares</span> <span class="badge">ticker</span>
+          <span class="badge">position</span> <span class="badge">lmtprice</span> <span class="badge">stopprice</span> <span class="badge">costbasis</span>
+          &nbsp; Commands: <span class="badge">BUY</span> <span class="badge">SELL</span> <span class="badge">CancelAll</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function _cmdById(id){
+  return (cmdState?.commands || []).find(x=>String(x?.id||'')===String(id||'')) || null;
+}
+
+function renderCommands(){
+  const list = document.getElementById('cmdList');
+  if (!list) return;
+  const arr = cmdState?.commands || [];
+  if (!cmdSelectedId && arr.length) cmdSelectedId = String(arr[0].id);
+  const rows = [];
+  for (const c of arr){
+    const id = String(c.id||'');
+    const name = String(c.name||id);
+    const on = (id === cmdSelectedId);
+    rows.push(`<div class="cmdItem ${on?'on':''}" data-id="${id}">
+      <div class="cmdName">${name}</div>
+      <div class="cmdSub">das:${id}</div>
+    </div>`);
+  }
+  list.innerHTML = rows.join('') || `<div class="cmdItem"><div class="cmdSub">No commands yet. Click “New”.</div></div>`;
+  list.querySelectorAll('.cmdItem[data-id]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.preventDefault();
+      cmdSelectedId = el.getAttribute('data-id');
+      _loadCmdToEditor();
+      renderCommands();
+    });
+  });
+}
+
+function _loadCmdToEditor(){
+  const c = _cmdById(cmdSelectedId);
+  const nameEl = document.getElementById('cmdName');
+  const idEl = document.getElementById('cmdId');
+  const scEl = document.getElementById('cmdScript');
+  const msgEl = document.getElementById('cmdMsg');
+  if (msgEl) msgEl.textContent = '';
+  if (!c){
+    if (nameEl) nameEl.value = '';
+    if (idEl) idEl.textContent = '(no selection)';
+    if (scEl) scEl.value = '';
+    return;
+  }
+  if (nameEl) nameEl.value = String(c.name||'');
+  if (idEl) idEl.textContent = `das:${String(c.id||'')}`;
+  if (scEl) scEl.value = String(c.script||'');
+}
+
+function _saveEditorToCmd(){
+  const c = _cmdById(cmdSelectedId);
+  if (!c) return;
+  const nameEl = document.getElementById('cmdName');
+  const scEl = document.getElementById('cmdScript');
+  const nm = String(nameEl?.value || '').trim();
+  if (nm) c.name = nm;
+  c.script = String(scEl?.value || '');
+}
+
+function initCommandsWindow(){
+  // cmdState is already initialized; just ensure shape.
+  cmdState = _normalizeCmdState(cmdState);
+  const msgEl = document.getElementById('cmdMsg');
+  const nameEl = document.getElementById('cmdName');
+  const scEl = document.getElementById('cmdScript');
+
+  const touch = ()=>{
+    try { _saveEditorToCmd(); } catch {}
+    try { saveCommands(); } catch {}
+    try { renderCommands(); } catch {}
+  };
+  nameEl?.addEventListener('input', touch);
+  scEl?.addEventListener('input', touch);
+
+  document.getElementById('cmdNew')?.addEventListener('click', (e)=>{
+    e.preventDefault();
+    const id = _newCmdId();
+    const c = { id, name: `Command ${ (cmdState.commands.length + 1) }`, script: '' };
+    cmdState.commands.push(c);
+    cmdSelectedId = id;
+    saveCommands();
+    renderCommands();
+    _loadCmdToEditor();
+  });
+
+  document.getElementById('cmdDel')?.addEventListener('click', (e)=>{
+    e.preventDefault();
+    if (!cmdSelectedId) return;
+    cmdState.commands = (cmdState.commands || []).filter(x=>String(x.id||'') !== String(cmdSelectedId||''));
+    cmdSelectedId = cmdState.commands[0]?.id || null;
+    saveCommands();
+    renderCommands();
+    _loadCmdToEditor();
+  });
+
+  document.getElementById('cmdSave')?.addEventListener('click', (e)=>{
+    e.preventDefault();
+    touch();
+    if (msgEl) msgEl.textContent = 'Saved.';
+  });
+
+  document.getElementById('cmdCheck')?.addEventListener('click', async (e)=>{
+    e.preventDefault();
+    const c = _cmdById(cmdSelectedId);
+    if (!c) return;
+    const res = await validateDasScriptRemote(String(c.script||''));
+    if (res?.ok) { if (msgEl) msgEl.textContent = 'OK'; }
+    else {
+      const er = (res?.errors && res.errors[0]) ? res.errors[0] : {message:'Invalid', line:1, col:1};
+      if (msgEl) msgEl.textContent = `Error @ ${er.line}:${er.col} — ${er.message}`;
+    }
+  });
+
+  document.getElementById('cmdRun')?.addEventListener('click', async (e)=>{
+    e.preventDefault();
+    const c = _cmdById(cmdSelectedId);
+    if (!c) return;
+    const res = await validateDasScriptRemote(String(c.script||''));
+    if (!res?.ok) {
+      const er = (res?.errors && res.errors[0]) ? res.errors[0] : {message:'Invalid', line:1, col:1};
+      if (msgEl) msgEl.textContent = `Error @ ${er.line}:${er.col} — ${er.message}`;
+      return;
+    }
+    if (msgEl) msgEl.textContent = '';
+    try { runDasScript(String(c.script||''), { name: String(c.name||''), id: String(c.id||'') }); }
+    catch (err) { if (msgEl) msgEl.textContent = `Run failed: ${err?.message ?? err}`; }
+  });
+
+  renderCommands();
+  _loadCmdToEditor();
 }
 
 function loadPosCols(){
@@ -3151,6 +3751,26 @@ async function loadSnapshot(){
   if (tl) tl.innerHTML = '';
   // Snapshot trades are in ascending time; prepend oldest->newest so newest ends up at top.
   for (const tr of (data.trades || [])) appendTape(tr);
+  // Seed session-like quote stats from the snapshot candle window (best-effort).
+  try {
+    const cs = Array.isArray(data.candles) ? data.candles : [];
+    if (cs.length) {
+      const o = Number(cs[0]?.o);
+      const hi = Math.max(...cs.map(c=>Number(c?.h)).filter(Number.isFinite));
+      const lo = Math.min(...cs.map(c=>Number(c?.l)).filter(Number.isFinite));
+      const pcl = (cs.length >= 2) ? Number(cs[cs.length-2]?.c) : Number(cs[0]?.o);
+      sessionStats = {
+        open: Number.isFinite(o) ? o : null,
+        hi: Number.isFinite(hi) ? hi : null,
+        lo: Number.isFinite(lo) ? lo : null,
+        pcl: Number.isFinite(pcl) ? pcl : null,
+      };
+    } else {
+      sessionStats = { open: null, hi: null, lo: null, pcl: null };
+    }
+  } catch {
+    sessionStats = { open: null, hi: null, lo: null, pcl: null };
+  }
   loadedStartNs = data.ts_effective;
   // Reset playhead + tape monotonic guard at snapshot time (prevents rewinds on resume).
   playheadNs = loadedStartNs;
@@ -3200,6 +3820,16 @@ function startBookTapeStream(tsNs){
       // Guard against rewinds (e.g., resume from an older playhead) which makes the tape "jump backwards".
       if (lastTapeTsSeen != null && msg.ts_event < lastTapeTsSeen) return;
       lastTapeTsSeen = msg.ts_event;
+      // Update quote-like stats (best-effort)
+      try {
+        lastTrade = msg;
+        const px = Number(msg.price);
+        if (Number.isFinite(px)) {
+          if (sessionStats.open == null) sessionStats.open = px;
+          sessionStats.hi = (sessionStats.hi == null) ? px : Math.max(sessionStats.hi, px);
+          sessionStats.lo = (sessionStats.lo == null) ? px : Math.min(sessionStats.lo, px);
+        }
+      } catch {}
       appendTape(msg);
       updatePlayhead(msg.ts_event);
       // drive higher-TF charts' in-progress bar close/high/low/volume in real-time
@@ -3407,6 +4037,14 @@ makeWindow({
 initEntryWindow();
 
 makeWindow({
+  id: 'commands',
+  title: 'Commands',
+  x: 876, y: 444, w: 520, h: 360,
+  bodyHtml: makeCommandsHtml()
+});
+initCommandsWindow();
+
+makeWindow({
   id: 'positions',
   title: 'Positions',
   x: 12, y: 404, w: 640, h: 220,
@@ -3531,6 +4169,7 @@ winPanel.innerHTML = `
     <button class="wbtn" data-win="l2">LVL2</button>
     <button class="wbtn" data-win="tape">Tape</button>
     <button class="wbtn" data-win="entry">Order Entry</button>
+    <button class="wbtn" data-win="commands">Commands</button>
     <button class="wbtn" data-win="positions">Positions</button>
     <button class="wbtn" data-win="history">History</button>
     <button class="wbtn" data-win="orders">Open Orders</button>
@@ -3971,9 +4610,11 @@ def index():
 
     layout = _read_cfg("layout")
     hotkeys = _read_cfg("hotkeys")
+    commands = _read_cfg("commands")
     html = INDEX_HTML
     html = html.replace("__DISK_LAYOUT__", json.dumps(layout) if layout is not None else "null")
     html = html.replace("__DISK_HOTKEYS__", json.dumps(hotkeys) if hotkeys is not None else "null")
+    html = html.replace("__DISK_COMMANDS__", json.dumps(commands) if commands is not None else "null")
     return HTMLResponse(html)
 
 
@@ -4026,7 +4667,7 @@ async def config_save_as(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}") from e
 
-    if kind not in ("layout", "hotkeys"):
+    if kind not in ("layout", "hotkeys", "commands"):
         raise HTTPException(status_code=400, detail="Unknown config kind")
     try:
         safe = _sanitize_cfg_filename(str(filename or ""))
@@ -4038,6 +4679,24 @@ async def config_save_as(request: Request):
         p = CONFIGS_DIR / safe
         p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
         return JSONResponse({"ok": True, "kind": kind, "filename": safe, "path": str(p)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@APP.post("/api/commands/validate")
+async def commands_validate(request: Request):
+    """
+    Validate a DAS-like script string for syntax + allowed vars/commands.
+    """
+    try:
+        payload = await request.json()
+        script = str(payload.get("script") or "")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}") from e
+    try:
+        from Commands import validate_script  # Simulator/Commands.py (local module)
+
+        return JSONResponse(validate_script(script))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
