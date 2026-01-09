@@ -778,6 +778,29 @@ function fmtPx(p){
   return Number(p).toFixed(4);
 }
 
+function _roundTo(x, decimals){
+  const d = Math.max(0, Math.floor(Number(decimals || 0)));
+  const f = Math.pow(10, d);
+  // Add a tiny epsilon to reduce floating rounding artifacts (e.g. 1.005).
+  return Math.round((Number(x) + Number.EPSILON) * f) / f;
+}
+// Stocks >= $1: round to cents. Stocks < $1: round to mills.
+function _roundLmtPx(px){
+  const p = Number(px);
+  if (!Number.isFinite(p)) return null;
+  const dec = (p < 1) ? 3 : 2;
+  return { px: _roundTo(p, dec), dec };
+}
+function _applyLmtRoundingEl(el){
+  if (!el) return;
+  const raw = String(el.value || '').trim();
+  if (!raw) return;
+  const r = _roundLmtPx(raw);
+  if (!r) return;
+  try { el.step = (r.dec === 3) ? '0.001' : '0.01'; } catch {}
+  el.value = Number(r.px).toFixed(r.dec);
+}
+
 // ---------------- LVL2 appearance settings ----------------
 const L2_TIER_COLORS_KEY = 'sim-l2-tier-colors-v1';
 const L2_DEFAULT_TIER_COLORS = ['#ffd400', '#ffffff', '#31ff69', '#ff3b3b'];
@@ -1137,7 +1160,11 @@ function tvInit(chart){
     chart.tv = LightweightCharts.createChart(chart.container, {
       layout: { background: { color: '#0b1220' }, textColor: 'rgba(230,237,243,0.9)' },
       grid: { vertLines: { color: 'rgba(34,48,69,0.55)' }, horzLines: { color: 'rgba(34,48,69,0.55)' } },
-      rightPriceScale: { borderColor: 'rgba(34,48,69,0.8)' },
+      rightPriceScale: {
+        borderColor: 'rgba(34,48,69,0.8)',
+        // Reduce wasted headroom while keeping space for the volume band at the bottom.
+        scaleMargins: { top: 0.05, bottom: 0.22 },
+      },
       timeScale: {
         borderColor: 'rgba(34,48,69,0.8)',
         timeVisible: true,
@@ -1151,6 +1178,7 @@ function tvInit(chart){
     try { chart.tv.applyOptions({
       localization: { timeFormatter: _tvTimeFormatter },
       timeScale: { tickMarkFormatter: _tvTickMarkFormatter, secondsVisible: (chart.tf === '1s' || chart.tf === '10s') },
+      rightPriceScale: { scaleMargins: { top: 0.05, bottom: 0.22 } },
     }); } catch {}
   } catch (e) {
     const msg = `LightweightCharts.createChart failed: ${e?.message ?? e}`;
@@ -1197,11 +1225,13 @@ function tvInit(chart){
       if (!param || !param.time) { chart.ohlcEl.textContent = ''; return; }
       const data = param.seriesData?.get?.(chart.candleSeries);
       if (!data) { chart.ohlcEl.textContent = ''; return; }
+      const vData = chart.volSeries ? (param.seriesData?.get?.(chart.volSeries) ?? null) : null;
+      const vv = (vData && Number.isFinite(Number(vData.value))) ? Math.trunc(Number(vData.value)) : null;
       const sec = Number(param.time);
       const tNs = Number.isFinite(sec) ? (sec * 1e9) : null;
       if (tNs == null) { chart.ohlcEl.textContent = ''; return; }
       chart.ohlcEl.textContent =
-        `${nsToEt(tNs)}  O ${fmtPx(data.open)}  H ${fmtPx(data.high)}  L ${fmtPx(data.low)}  C ${fmtPx(data.close)}`;
+        `${nsToEt(tNs)}  O ${fmtPx(data.open)}  H ${fmtPx(data.high)}  L ${fmtPx(data.low)}  C ${fmtPx(data.close)}  V ${vv ?? ''}`;
     });
   } catch (e) {
     // non-fatal
@@ -1235,11 +1265,31 @@ function tvSetData(chart){
   const candles = (chart.candles || []).filter(c=>c && Number.isFinite(c.t));
   const data = candles.map(_tvCandleFromInternal).filter(x=>x);
   const vols = candles.map(_tvVolFromInternal).filter(x=>x);
+  const ts = chart.tv?.timeScale?.();
+  const prevRange = ts?.getVisibleLogicalRange?.() || null;
+  const prevLen = (chart._lastSetDataLen != null) ? Number(chart._lastSetDataLen) : null;
   try {
     console.debug(`[tv] setData ${chart.id} tf=${chart.tf} candles=${data.length} vols=${vols.length}`);
     chart.candleSeries.setData(data);
     if (chart.volSeries) chart.volSeries.setData(vols);
-    try { chart.tv?.timeScale?.().fitContent(); } catch {}
+    chart._lastSetDataLen = data.length;
+    // IMPORTANT: do NOT fitContent() on every setData. That "zooms out" the chart periodically
+    // (especially on higher TF when completed candles are applied). Only auto-fit on initial load
+    // or explicit snapshot reload.
+    if (chart._fitNext) {
+      chart._fitNext = false;
+      try { ts?.fitContent?.(); } catch {}
+    } else if (prevRange && ts?.setVisibleLogicalRange) {
+      try {
+        // If we prepended history (len grew), shift the logical range so the user stays on the same bars.
+        if (prevLen != null && Number.isFinite(prevLen) && data.length > prevLen) {
+          const delta = data.length - prevLen;
+          ts.setVisibleLogicalRange({ from: prevRange.from + delta, to: prevRange.to + delta });
+        } else {
+          ts.setVisibleLogicalRange(prevRange);
+        }
+      } catch {}
+    }
     if (chart.hudEl) chart.hudEl.textContent = `Bars: ${data.length}`;
     chart._indDirty = true;
   } catch (e) {
@@ -1468,7 +1518,6 @@ function tvRenderIndicators(chart){
     try { chart.macdLineSeries?.setData?.(m.macPts); } catch (e) { console.error('MACD line setData failed', e); }
     try { chart.macdSignalSeries?.setData?.(m.sigPts); } catch (e) { console.error('MACD signal setData failed', e); }
     try { chart.macdHistSeries?.setData?.(m.histPts); } catch (e) { console.error('MACD hist setData failed', e); }
-    try { chart.macdTv.timeScale().fitContent(); } catch {}
   }
   tvResize(chart);
 }
@@ -1700,12 +1749,6 @@ function makeEntryHtml(){
   return `
     <div class="entryWrap">
       <div class="entryGrid">
-        <div class="lbl">Side</div>
-        <select id="entry-side">
-          <option value="BUY" selected>BUY</option>
-          <option value="SELL">SELL</option>
-        </select>
-
         <div class="lbl">Order</div>
         <select id="entry-ordtype">
           <option value="MKT">Market</option>
@@ -1719,7 +1762,7 @@ function makeEntryHtml(){
 
         <div class="lbl">Limit</div>
         <div class="entryRow2">
-          <input id="entry-lmt" class="num" type="number" step="0.01" placeholder="LMT Price"/>
+          <input id="entry-lmt" class="num" type="number" step="0.001" placeholder="LMT Price"/>
           <div class="entrySmallBtns">
             <button class="wbtn" id="entry-px-bid" title="Set to current bid">Bid</button>
             <button class="wbtn" id="entry-px-ask" title="Set to current ask">Ask</button>
@@ -1751,7 +1794,6 @@ function makeEntryHtml(){
 }
 
 function initEntryWindow(){
-  const sideEl = $('entry-side');
   const ordEl = $('entry-ordtype');
   const sharesEl = $('entry-shares');
   const lmtEl = $('entry-lmt');
@@ -1764,6 +1806,7 @@ function initEntryWindow(){
     if (!el) return;
     if (v == null || !Number.isFinite(Number(v))) return;
     el.value = String(Number(v));
+    if (el === lmtEl) _applyLmtRoundingEl(lmtEl);
   };
   const bid = ()=> currentBook?.bids?.[0]?.[0];
   const ask = ()=> currentBook?.asks?.[0]?.[0];
@@ -1778,12 +1821,6 @@ function initEntryWindow(){
   $('entry-px-ask')?.addEventListener('click', (e)=>{ e.preventDefault(); setNum(lmtEl, ask()); });
   $('entry-px-mid')?.addEventListener('click', (e)=>{ e.preventDefault(); setNum(lmtEl, mid()); });
   $('entry-px-last')?.addEventListener('click', (e)=>{ e.preventDefault(); setNum(lmtEl, last()); });
-
-  const syncButtons = ()=>{
-    const side = sideEl?.value || 'BUY';
-    if (buyBtn) buyBtn.textContent = (side === 'BUY') ? 'BUY (primary)' : 'BUY';
-    if (sellBtn) sellBtn.textContent = (side === 'SELL') ? 'SELL (primary)' : 'SELL';
-  };
 
   const syncFields = ()=>{
     const t = ordEl?.value || 'LMT';
@@ -1800,17 +1837,17 @@ function initEntryWindow(){
     }
   };
 
-  sideEl?.addEventListener('change', syncButtons);
   ordEl?.addEventListener('change', syncFields);
-  syncButtons();
   syncFields();
+  lmtEl?.addEventListener('blur', ()=>_applyLmtRoundingEl(lmtEl));
 
   // Place order (simple MKT/LMT for now).
   const send = (forcedSide)=>{
     const symbol = $('symbol')?.value?.trim?.() ?? '';
-    const side = forcedSide || sideEl?.value || 'BUY';
+    const side = forcedSide || 'BUY';
     const ordType = ordEl?.value || 'LMT';
     const shares = Number(sharesEl?.value || 0);
+    if (ordType === 'LMT') _applyLmtRoundingEl(lmtEl);
     const lmt = lmtEl?.value ? Number(lmtEl.value) : null;
     const stop = stopEl?.value ? Number(stopEl.value) : null;
     const route = String(routeEl?.value || '').trim();
@@ -2457,8 +2494,8 @@ function _envSnapshot(){
       const n = String(name||'').toLowerCase();
       if (n === 'shares') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(0, Math.floor(Number(v)))); return; }
       if (n === 'share') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(0, Math.floor(Number(v)))); return; }
-      if (n === 'lmtprice') { const el=document.getElementById('entry-lmt'); if (el) el.value=String(Number(v)); return; }
-      if (n === 'price') { const el=document.getElementById('entry-lmt'); if (el) el.value=String(Number(v)); return; }
+      if (n === 'lmtprice') { const el=document.getElementById('entry-lmt'); if (el) { el.value=String(Number(v)); _applyLmtRoundingEl(el); } return; }
+      if (n === 'price') { const el=document.getElementById('entry-lmt'); if (el) { el.value=String(Number(v)); _applyLmtRoundingEl(el); } return; }
       if (n === 'stopprice') { const el=document.getElementById('entry-stop'); if (el) el.value=String(Number(v)); return; }
       if (n === 'route') { const el=document.getElementById('entry-route'); if (el) el.value=String(v); return; }
       if (n === 'stoptype') {
@@ -3684,19 +3721,18 @@ function makeChartHtml(chartId){
     </div>
     <div class="ohlcHud" style="margin-top:6px; color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; min-height: 16px;"></div>
     <div class="chartWrap" style="flex: 1 1 auto; min-height: 220px;">
-      <div class="tfOverlay" style="position:absolute; left:10px; top:10px; z-index:5; display:flex; gap:6px; padding:6px; border:1px solid var(--grid); border-radius:10px; background: rgba(15,23,35,0.85);">
+      <div class="tfOverlay" style="position:absolute; left:10px; top:10px; z-index:5; display:flex; gap:8px; align-items:center; padding:6px; border:1px solid var(--grid); border-radius:10px; background: rgba(15,23,35,0.85);">
         <button class="wbtn tfBtn" data-tf="1s" style="padding:4px 8px;">1s</button>
         <button class="wbtn tfBtn" data-tf="10s" style="padding:4px 8px;">10s</button>
         <button class="wbtn tfBtn" data-tf="1m" style="padding:4px 8px;">1m</button>
         <button class="wbtn tfBtn" data-tf="5m" style="padding:4px 8px;">5m</button>
-      </div>
-      <div class="indOverlay" style="position:absolute; right:10px; top:10px; z-index:5; display:flex; gap:8px; align-items:center; padding:6px; border:1px solid var(--grid); border-radius:10px; background: rgba(15,23,35,0.85);">
+        <div style="width:1px; height:18px; background: rgba(34,48,69,0.9); margin:0 2px;"></div>
         <label class="hint" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" class="indSma" checked/> SMA</label>
         <label class="hint" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" class="indVwap"/> VWAP</label>
         <label class="hint" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" class="indMacd"/> MACD</label>
         <button class="wbtn indGear" title="Indicator settings" style="padding:4px 8px;">⚙</button>
       </div>
-      <div class="indPanel" style="display:none; position:absolute; right:10px; top:52px; z-index:6; width:260px; padding:10px; border:1px solid var(--grid); border-radius:10px; background: rgba(15,23,35,0.95);">
+      <div class="indPanel" style="display:none; position:absolute; left:10px; top:52px; z-index:6; width:260px; padding:10px; border:1px solid var(--grid); border-radius:10px; background: rgba(15,23,35,0.95);">
         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
           <div style="color:var(--muted); font-weight:700; font-size:12px;">Indicator settings</div>
           <button class="wbtn indClose" style="padding:4px 8px;">Close</button>
@@ -3801,6 +3837,11 @@ function createChartWindow(tf){
     loadingMore: false,
     canLoadMore: true,
     _tvNeedsSetData: true,
+    // Zoom/scroll behavior:
+    // - We only auto-fit on initial snapshot load (otherwise setData causes periodic zoom-outs).
+    _fitNext: true,
+    // Used to preserve the user's view when we prepend history (loadMoreHistory).
+    _lastSetDataLen: null,
   };
   charts.set(id, chart);
 
@@ -4313,6 +4354,8 @@ async function loadChartSnapshot(chart){
   }
   chart.pendingCandles?.clear?.();
   chart.canLoadMore = true;
+  chart._fitNext = true;
+  chart._lastSetDataLen = null;
   chart.candles = [];
   const candles = (data.candles || []).filter(c=>c && Number.isFinite(c.t));
   candles.sort((a,b)=>a.t-b.t);
