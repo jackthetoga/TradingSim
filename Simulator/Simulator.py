@@ -384,7 +384,7 @@ style.textContent = `
   /* Commands (DAS-like scripting) */
   .cmdWrap { display:grid; grid-template-columns: 280px 1fr; gap: 10px; height: 100%; min-height: 0; }
   .cmdLeft { display:flex; flex-direction:column; gap:10px; min-height:0; }
-  .cmdRight { display:flex; flex-direction:column; gap:10px; min-height:0; }
+  .cmdRight { display:flex; flex-direction:column; gap:10px; min-height:0; overflow:auto; padding-bottom: 6px; }
   .cmdList { flex:1 1 auto; min-height:0; overflow:auto; border:1px solid rgba(34,48,69,0.55); border-radius:10px; }
   .cmdItem { padding:8px 10px; border-bottom:1px solid rgba(34,48,69,0.35); cursor:pointer; }
   .cmdItem:hover { background: rgba(255,255,255,0.03); }
@@ -393,7 +393,7 @@ style.textContent = `
   .cmdSub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .cmdRow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .cmdTa {
-    flex: 1 1 auto; min-height: 160px; width: 100%; resize: none;
+    flex: 0 0 220px; height: 220px; min-height: 220px; width: 100%; resize: vertical;
     background: #0f1723; border: 1px solid var(--grid); color: var(--fg);
     padding: 10px; border-radius: 10px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
@@ -401,6 +401,7 @@ style.textContent = `
   }
   .cmdBtns { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .badge { display:inline-flex; align-items:center; padding:2px 8px; border-radius:999px; border:1px solid var(--grid); background: rgba(0,0,0,0.15); color: var(--muted); font-size:12px; font-weight:800; }
+  .cmdFooter { position: sticky; bottom: 0; background: rgba(15,23,35,0.97); padding-top: 8px; }
 `;
 document.head.appendChild(style);
 
@@ -1258,7 +1259,7 @@ function makeEntryHtml(){
         </select>
 
         <div class="lbl">Shares</div>
-        <input id="entry-shares" class="num" type="number" min="1" step="1" value="100"/>
+        <input id="entry-shares" class="num" type="number" min="0" step="1" value="100"/>
 
         <div class="lbl">Limit</div>
         <div class="entryRow2">
@@ -1644,15 +1645,6 @@ function exportHotkeysState(){
 
 function _allCommands(){
   const cmds = [...BASE_COMMANDS, ..._cmdCatalog()];
-  try {
-    const cc = hkCustom && typeof hkCustom === 'object' ? hkCustom : {};
-    for (const [id, meta] of Object.entries(cc)){
-      if (!String(id).startsWith('custom:')) continue;
-      const label = String(meta?.label || id);
-      const contexts = Array.isArray(meta?.contexts) && meta.contexts.length ? meta.contexts : ['global','entry','chart','tape','l2'];
-      cmds.push({ id, label, contexts });
-    }
-  } catch {}
   return cmds;
 }
 
@@ -2004,8 +1996,8 @@ function _envSnapshot(){
     },
     set: (name, v)=>{
       const n = String(name||'').toLowerCase();
-      if (n === 'shares') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(1, Math.floor(Number(v)))); return; }
-      if (n === 'share') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(1, Math.floor(Number(v)))); return; }
+      if (n === 'shares') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(0, Math.floor(Number(v)))); return; }
+      if (n === 'share') { const el=document.getElementById('entry-shares'); if (el) el.value=String(Math.max(0, Math.floor(Number(v)))); return; }
       if (n === 'lmtprice') { const el=document.getElementById('entry-lmt'); if (el) el.value=String(Number(v)); return; }
       if (n === 'price') { const el=document.getElementById('entry-lmt'); if (el) el.value=String(Number(v)); return; }
       if (n === 'stopprice') { const el=document.getElementById('entry-stop'); if (el) el.value=String(Number(v)); return; }
@@ -2183,25 +2175,13 @@ function makeHotkeysHtml(){
       </div>
       <div class="setSection">
         <div class="setRow">
-          <div style="color:var(--muted); font-size:12px; font-weight:900;">Custom commands</div>
+          <div style="color:var(--muted); font-size:12px; font-weight:900;">Hotkeys</div>
           <div style="flex:1;"></div>
           <button class="wbtn" id="hkSaveAs" title="Save hotkeys to a custom file">Save As…</button>
         </div>
         <div style="height:8px;"></div>
-        <div class="setRow">
-          <input id="hkCustomId" placeholder="id (suffix), e.g. my-buy" style="width:180px;" />
-          <input id="hkCustomLabel" placeholder="Label, e.g. Buy 500 @ MKT" style="width:240px;" />
-          <select id="hkCustomAlias" style="min-width:240px;"></select>
-          <button class="wbtn" id="hkCustomAdd">Add</button>
-        </div>
-        <div style="height:8px;"></div>
-        <div class="setHint">Custom commands are stored in the hotkeys JSON under <code>customCommands</code> and can be bound like any other command.</div>
-        <div style="height:10px;"></div>
-        <div style="overflow:auto; max-height: 160px;">
-          <table class="posTable">
-            <thead><tr><th>ID</th><th>Label</th><th>Alias</th><th></th></tr></thead>
-            <tbody id="hkCustomBody"></tbody>
-          </table>
+        <div class="setHint">
+          Use the <code>Commands</code> window to create DAS scripts, then bind them here (command id <code>das:&lt;id&gt;</code>).
         </div>
       </div>
     </div>
@@ -2213,53 +2193,6 @@ function makeHotkeysHtml(){
       </div>
     </div>
   `;
-}
-
-function renderCustomCommands(){
-  const body = document.getElementById('hkCustomBody');
-  const aliasSel = document.getElementById('hkCustomAlias');
-  if (!body || !aliasSel) return;
-
-  // alias dropdown uses only built-ins (no custom -> no recursion by default)
-  aliasSel.innerHTML = BASE_COMMANDS.map(c=>`<option value="${c.id}">${c.label} (${c.id})</option>`).join('');
-
-  const rows = [];
-  const cc = hkCustom && typeof hkCustom === 'object' ? hkCustom : {};
-  for (const [id, meta] of Object.entries(cc)){
-    if (!String(id).startsWith('custom:')) continue;
-    const label = String(meta?.label || id);
-    const alias = String(meta?.alias || '');
-    rows.push(`
-      <tr>
-        <td><span class="hkBadge">${id}</span></td>
-        <td>${label}</td>
-        <td><span class="entryHint">${alias || '(none)'}</span></td>
-        <td style="display:flex; gap:8px; justify-content:flex-end;">
-          <button class="wbtn" data-cc="del" data-id="${id}">Delete</button>
-        </td>
-      </tr>
-    `);
-  }
-  body.innerHTML = rows.join('') || `<tr><td colspan="4" class="entryHint">No custom commands yet.</td></tr>`;
-
-  body.querySelectorAll('button[data-cc="del"]').forEach(btn=>{
-    btn.addEventListener('click', (e)=>{
-      e.preventDefault();
-      const id = btn.getAttribute('data-id');
-      if (!id) return;
-      try { delete hkCustom[id]; } catch {}
-      // remove bindings that reference deleted command
-      for (const ctx of HK_CONTEXTS){
-        const map = hk?.[ctx] || {};
-        for (const [ch, b] of Object.entries(map)){
-          if (b?.cmd === id) delete map[ch];
-        }
-        hk[ctx] = map;
-      }
-      saveHotkeys();
-      renderHotkeys();
-    });
-  });
 }
 
 function renderHotkeys(){
@@ -2280,17 +2213,7 @@ function renderHotkeys(){
 
   const q = String(hkFilter || '').trim().toLowerCase();
   const allowed = _allCommands().filter(c=> c.contexts.includes(hkTab));
-
-  // also show any unknown custom commands that already exist in bindings for this context
   const ctxMap = hk?.[hkTab] || {};
-  const extraCmds = new Set();
-  for (const b of Object.values(ctxMap)){
-    const cmd = b?.cmd;
-    if (cmd && !allowed.some(x=>x.id === cmd) && String(cmd).startsWith('custom:')) extraCmds.add(cmd);
-  }
-  for (const cmd of extraCmds){
-    allowed.push({ id: cmd, label: `Custom: ${cmd}`, contexts:[hkTab] });
-  }
 
   const rows = [];
   for (const c of allowed){
@@ -2338,7 +2261,6 @@ function renderHotkeys(){
     });
   });
 
-  try { renderCustomCommands(); } catch {}
 }
 
 function initHotkeysWindow(){
@@ -2358,21 +2280,6 @@ function initHotkeysWindow(){
       hkTab = b.getAttribute('data-ctx') || 'global';
       renderHotkeys();
     });
-  });
-  document.getElementById('hkCustomAdd')?.addEventListener('click', (e)=>{
-    e.preventDefault();
-    const suf = String(document.getElementById('hkCustomId')?.value || '').trim();
-    const label = String(document.getElementById('hkCustomLabel')?.value || '').trim();
-    const alias = String(document.getElementById('hkCustomAlias')?.value || '').trim();
-    if (!suf) { setErr('Custom command id is required'); return; }
-    if (!alias) { setErr('Custom command alias is required'); return; }
-    const id = suf.startsWith('custom:') ? suf : `custom:${suf}`;
-    hkCustom = hkCustom && typeof hkCustom === 'object' ? hkCustom : {};
-    hkCustom[id] = { label: label || id, alias, contexts: ['global','entry','chart','tape','l2'] };
-    try { document.getElementById('hkCustomId').value = ''; } catch {}
-    try { document.getElementById('hkCustomLabel').value = ''; } catch {}
-    saveHotkeys();
-    renderHotkeys();
   });
   document.getElementById('hkSaveAs')?.addEventListener('click', async (e)=>{
     e.preventDefault();
@@ -2484,6 +2391,7 @@ function makeCommandsHtml(){
       <div class="cmdLeft">
         <div class="cmdBtns">
           <button class="wbtn" id="cmdNew">New</button>
+          <button class="wbtn" id="cmdCopy">Copy</button>
           <button class="wbtn" id="cmdDel">Delete</button>
           <button class="wbtn" id="cmdSave">Save</button>
         </div>
@@ -2505,7 +2413,7 @@ function makeCommandsHtml(){
           <button class="wbtn primary" id="cmdRun">Run</button>
           <span class="entryHint" id="cmdMsg"></span>
         </div>
-        <div class="entryHint">
+        <div class="entryHint cmdFooter">
           Vars: <span class="badge">ask</span> <span class="badge">bid</span> <span class="badge">shares</span> <span class="badge">ticker</span>
           <span class="badge">position</span> <span class="badge">lmtprice</span> <span class="badge">stopprice</span> <span class="badge">costbasis</span>
           &nbsp; Commands: <span class="badge">BUY</span> <span class="badge">SELL</span> <span class="badge">CancelAll</span>
@@ -2597,6 +2505,26 @@ function initCommandsWindow(){
     saveCommands();
     renderCommands();
     _loadCmdToEditor();
+  });
+
+  document.getElementById('cmdCopy')?.addEventListener('click', (e)=>{
+    e.preventDefault();
+    const src = _cmdById(cmdSelectedId);
+    if (!src) return;
+    const id = _newCmdId();
+    const nm = String(src.name || 'Command').trim() || 'Command';
+    const c = { id, name: `Copy of ${nm}`, script: String(src.script || '') };
+    // insert next to the source command for convenience
+    const arr = cmdState.commands || [];
+    const idx = arr.findIndex(x=>String(x?.id||'') === String(src.id||''));
+    if (idx >= 0) arr.splice(idx+1, 0, c);
+    else arr.push(c);
+    cmdState.commands = arr;
+    cmdSelectedId = id;
+    saveCommands();
+    renderCommands();
+    _loadCmdToEditor();
+    if (msgEl) msgEl.textContent = 'Copied.';
   });
 
   document.getElementById('cmdDel')?.addEventListener('click', (e)=>{
