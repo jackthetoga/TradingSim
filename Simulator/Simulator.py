@@ -43,6 +43,10 @@ DATA_DIR_DEFAULT = Path("/Users/zizizink/Documents/TradingProject/databento_out"
 LOCAL_TZ_NAME_DEFAULT = "America/New_York"
 FIXED_PRICE_SCALE = 1_000_000_000  # legacy: Databento "fixed" price_type uses 1e9 scaling
 
+# Lightweight cache for the data catalog scan (prevents repeated heavy scans on page load / refresh).
+_CATALOG_CACHE: Dict[Tuple[str, str, int], Tuple[float, Dict[str, Any]]] = {}
+_CATALOG_CACHE_TTL_S = 5.0
+
 # Config persistence (saved to disk)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = PROJECT_ROOT / "Configs"
@@ -149,6 +153,11 @@ INDEX_HTML = r"""
     <label>Symbol <input id="symbol" value="MNTS" size="6"/></label>
     <label>Day <input id="day" value="2026-01-05" size="10"/></label>
     <label>Time (ET) <input id="ts" value="2026-01-05 09:30:00" size="24"/></label>
+    <label>Session
+      <select id="catalog">
+        <option value="">(scan sessions)</option>
+      </select>
+    </label>
     <label>Speed
       <select id="speed">
         <option value="0.5">0.5x</option>
@@ -184,6 +193,61 @@ const POPOUT = QS.get('popout'); // l2 | tape | chart-<id>
 
 function $(id){ return document.getElementById(id); }
 
+// ---------------- Session catalog dropdown ----------------
+let catalogMap = new Map();
+async function initCatalogDropdown(){
+  const sel = $('catalog');
+  if (!sel) return;
+  sel.disabled = true;
+  sel.innerHTML = `<option value="">(scan sessions)</option>`;
+  catalogMap = new Map();
+  try {
+    const resp = await fetch(`/api/catalog`);
+    const data = await resp.json();
+    if (!resp.ok){
+      const detail = data?.detail || 'Failed to load catalog';
+      sel.innerHTML = `<option value="">(catalog error)</option>`;
+      setErr(String(detail));
+      sel.disabled = false;
+      return;
+    }
+    const items = Array.isArray(data?.items) ? data.items : [];
+    sel.innerHTML = `<option value="">Sessions…</option>`;
+    for (const it of items){
+      const sym = String(it.symbol || '').trim();
+      const day = String(it.day || '').trim();
+      const ts = String(it.start_et || '').trim();
+      const label = String(it.label || '').trim() || `${sym} ${day}`;
+      const id = `${sym}__${day}__${Number(it.start_ts_ns ?? 0)}`;
+      catalogMap.set(id, {symbol: sym, day, ts, label});
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = label;
+      sel.appendChild(opt);
+    }
+    sel.disabled = false;
+  } catch (e) {
+    sel.innerHTML = `<option value="">(catalog error)</option>`;
+    sel.disabled = false;
+    setErr(`Catalog error: ${e?.message ?? e}`);
+  }
+
+  sel.addEventListener('change', async ()=>{
+    const id = sel.value;
+    if (!id) return;
+    const it = catalogMap.get(id);
+    if (!it) return;
+    try {
+      $('symbol').value = it.symbol;
+      $('day').value = it.day;
+      $('ts').value = it.ts;
+      await doLoad(true);
+    } catch (e) {
+      setErr(`Failed to load session: ${e?.message ?? e}`);
+    }
+  });
+}
+
 let zTop = 10;
 function bringToFront(win){
   zTop += 1;
@@ -201,6 +265,36 @@ function contextForWindowId(id){
   return 'global';
 }
 
+function closeWindow(win){
+  if (!win) return;
+  const id = String(win.id || '');
+  // Charts: remove entirely (do not persist in layout, do not keep DOM node)
+  if (id.startsWith('chart-')){
+    try {
+      const ch = charts?.get?.(id);
+      try { if (ch?.sse) { ch.sse.close(); ch.sse = null; } } catch {}
+      try { ch?._ro?.disconnect?.(); } catch {}
+      try { ch?.tv?.remove?.(); } catch {}
+      try { ch?.macdTv?.remove?.(); } catch {}
+      try { charts?.delete?.(id); } catch {}
+    } catch {}
+    try { win.remove(); } catch { try { win.parentNode?.removeChild?.(win); } catch {} }
+    try { scheduleLayoutSave(); } catch {}
+    return;
+  }
+  // Regular windows: hide, but do not persist any layout state for this "closed" window.
+  try { win.style.display = 'none'; } catch {}
+  try { win.dataset.closed = '1'; } catch {}
+  // Reset to defaults so re-opening doesn't "remember" the last position/size
+  try {
+    if (win.dataset.defaultX != null) win.style.left = `${Number(win.dataset.defaultX)}px`;
+    if (win.dataset.defaultY != null) win.style.top = `${Number(win.dataset.defaultY)}px`;
+    if (win.dataset.defaultW != null) win.style.width = `${Number(win.dataset.defaultW)}px`;
+    if (win.dataset.defaultH != null) win.style.height = `${Number(win.dataset.defaultH)}px`;
+  } catch {}
+  try { scheduleLayoutSave(); } catch {}
+}
+
 function makeWindow({id, title, x, y, w, h, bodyHtml}){
   const ws = $('workspace');
   const win = document.createElement('div');
@@ -211,6 +305,13 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
   win.style.width = `${w}px`;
   win.style.height = `${h}px`;
   win.style.zIndex = String(++zTop);
+  // Remember defaults for "close" behavior (do not remember last position)
+  try {
+    win.dataset.defaultX = String(x);
+    win.dataset.defaultY = String(y);
+    win.dataset.defaultW = String(w);
+    win.dataset.defaultH = String(h);
+  } catch {}
   win.innerHTML = `
     <div class="wtitle">
       <div class="wlabel">${title}</div>
@@ -220,13 +321,37 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
       </div>
     </div>
     <div class="wbody">${bodyHtml}</div>
+    <div class="wdragEdge wdragEdgeL" data-drag="edge"></div>
+    <div class="wdragEdge wdragEdgeR" data-drag="edge"></div>
     <div class="wresizer"></div>
   `;
   ws.appendChild(win);
+  function clampWinToWorkspace(){
+    try {
+      const wsW = ws?.clientWidth ?? 0;
+      const wsH = ws?.clientHeight ?? 0;
+      if (!Number.isFinite(wsW) || !Number.isFinite(wsH) || wsW <= 0 || wsH <= 0) return;
+      const winW = parseInt(win.style.width, 10) || win.offsetWidth || 0;
+      const winH = parseInt(win.style.height, 10) || win.offsetHeight || 0;
+      // Keep at least part of the window accessible so it can't be "lost".
+      const minVisibleX = 80;   // px of window that must remain visible horizontally
+      const minVisibleY = 34;   // px (title bar) that must remain visible vertically
+      let x = parseInt(win.style.left, 10) || 0;
+      let y = parseInt(win.style.top, 10) || 0;
+      const minX = -(Math.max(0, winW - minVisibleX));
+      const maxX = wsW - minVisibleX;
+      const minY = 0;
+      const maxY = wsH - minVisibleY;
+      x = Math.min(maxX, Math.max(minX, x));
+      y = Math.min(maxY, Math.max(minY, y));
+      win.style.left = `${x}px`;
+      win.style.top = `${y}px`;
+    } catch {}
+  }
   // drag
   const bar = win.querySelector('.wtitle');
   let dragging=false, sx=0, sy=0, ox=0, oy=0, dragPid=null;
-  bar.addEventListener('pointerdown', (e)=>{
+  const startDrag = (e)=>{
     if (e.target && e.target.closest('.wbtns')) return;
     dragging=true;
     bringToFront(win);
@@ -234,6 +359,11 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
     win.setPointerCapture(e.pointerId);
     sx=e.clientX; sy=e.clientY;
     ox=parseInt(win.style.left,10); oy=parseInt(win.style.top,10);
+  };
+  bar.addEventListener('pointerdown', startDrag);
+  // Chart windows can also be dragged by their side edges (helps prevent losing a chart off-screen).
+  win.querySelectorAll('[data-drag="edge"]').forEach(h=>{
+    h.addEventListener('pointerdown', startDrag);
   });
   // IMPORTANT: pointer capture is on `win`, so move/up/cancel handlers must be on `win`
   win.addEventListener('pointermove', (e)=>{
@@ -241,6 +371,7 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
     if (dragPid != null && e.pointerId !== dragPid) return;
     win.style.left = `${ox + (e.clientX - sx)}px`;
     win.style.top = `${oy + (e.clientY - sy)}px`;
+    clampWinToWorkspace();
   });
   const endDrag = (e)=>{
     if (!dragging) return;
@@ -248,6 +379,7 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
     dragging=false;
     try { if (dragPid != null) win.releasePointerCapture(dragPid); } catch {}
     dragPid=null;
+    clampWinToWorkspace();
     try { scheduleLayoutSave(); } catch {}
   };
   win.addEventListener('pointerup', endDrag);
@@ -269,6 +401,7 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
     if (rzPid != null && e.pointerId !== rzPid) return;
     win.style.width = `${Math.max(260, ow + (e.clientX - rsx))}px`;
     win.style.height = `${Math.max(200, oh + (e.clientY - rsy))}px`;
+    clampWinToWorkspace();
   });
   const endResize = (e)=>{
     if (!resizing) return;
@@ -276,6 +409,7 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
     resizing=false;
     try { if (rzPid != null) win.releasePointerCapture(rzPid); } catch {}
     rzPid=null;
+    clampWinToWorkspace();
     try { scheduleLayoutSave(); } catch {}
   };
   win.addEventListener('pointerup', endResize);
@@ -286,7 +420,7 @@ function makeWindow({id, title, x, y, w, h, bodyHtml}){
   win.querySelectorAll('.wbtn').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const act = btn.getAttribute('data-act');
-      if (act === 'close') { win.style.display = 'none'; try { scheduleLayoutSave(); } catch {} }
+      if (act === 'close') { closeWindow(win); }
       if (act === 'pop') {
         const url = new URL(location.href);
         url.searchParams.set('popout', id);
@@ -316,6 +450,12 @@ style.textContent = `
   .wbtns { display: flex; gap: 6px; }
   .wbtn { padding: 4px 8px; border-radius: 8px; background: #0f1723; border: 1px solid var(--grid); color: var(--fg); font-size: 12px; cursor: pointer; }
   .wbody { height: calc(100% - 34px); padding: 10px 12px; overflow: auto; }
+  /* Chart-only drag handles on the side edges (prevents losing the chart if title bar goes off-screen). */
+  .wdragEdge { position: absolute; top: 34px; bottom: 16px; width: 12px; z-index: 40; display: none; background: transparent; }
+  .wdragEdgeL { left: 0; cursor: grab; }
+  .wdragEdgeR { right: 0; cursor: grab; }
+  .win.chartWin .wdragEdge { display: block; }
+  .win.chartWin .wdragEdge:hover { background: rgba(230,237,243,0.04); }
   .wresizer { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize;
               background: linear-gradient(135deg, transparent 50%, rgba(230,237,243,0.18) 50%); }
   /* Multi-chart canvases must fill their wrapper; otherwise indicators/volume can be drawn "below" the visible area. */
@@ -435,6 +575,82 @@ let lastTapeTsSeen = null;   // for monotonic tape rendering (prevents "time goi
 let lastTrade = null;        // last trade seen (for initializing live higher-TF candles)
 let sessionStats = { open: null, hi: null, lo: null, pcl: null }; // best-effort quote-like fields
 
+// Perf: coalesce bursty SSE events into a single render per animation frame.
+let _pendingBook = null;
+let _pendingTrades = [];
+let _pendingMaxTs = null;
+let _replayFlushRaf = null;
+const MAX_TAPE_RENDER_PER_FRAME = 120; // render cap; prevents DOM blowups during intense bursts
+const MAX_TRADES_PROCESS_PER_FRAME = 2000; // processing cap; prevents long JS tasks during bursts
+
+function _scheduleReplayFlush(){
+  if (_replayFlushRaf != null) return;
+  _replayFlushRaf = requestAnimationFrame(()=>{
+    _replayFlushRaf = null;
+    const book = _pendingBook;
+    const trades = _pendingTrades;
+    const maxTs = _pendingMaxTs;
+    _pendingBook = null;
+    _pendingTrades = [];
+    _pendingMaxTs = null;
+
+    if (book) {
+      currentBook = book;
+      renderL2(currentBook);
+    }
+
+    let remainder = [];
+    let procTrades = trades;
+    if (Array.isArray(trades) && trades.length > MAX_TRADES_PROCESS_PER_FRAME) {
+      procTrades = trades.slice(0, MAX_TRADES_PROCESS_PER_FRAME);
+      remainder = trades.slice(MAX_TRADES_PROCESS_PER_FRAME);
+    }
+
+    if (Array.isArray(procTrades) && procTrades.length) {
+      // Process fills/chart logic in chronological order, but render tape (newest-first) in a bounded batch.
+      for (let i=0; i<procTrades.length; i++){
+        const tr = procTrades[i];
+        if (!tr) continue;
+        // Guard against rewinds (e.g., resume from an older playhead) which makes the tape "jump backwards".
+        if (lastTapeTsSeen != null && tr.ts_event < lastTapeTsSeen) continue;
+        lastTapeTsSeen = tr.ts_event;
+        lastTrade = tr;
+        try { maybeFillFromTrade(tr); } catch {}
+        // drive higher-TF charts' in-progress bar close/high/low/volume in real-time
+        try {
+          for (const ch of charts.values()) {
+            updateChartFromTrade(ch, Number(tr.ts_event), Number(tr.price), Number(tr.size));
+          }
+        } catch {}
+      }
+
+      // Tape render: newest at top
+      const slice = procTrades.slice(-MAX_TAPE_RENDER_PER_FRAME);
+      slice.reverse(); // newest-first for appendTapeBatch
+      appendTapeBatch(slice);
+    }
+
+    // Trading UI refresh once per frame (positions / working orders / etc.)
+    if (book || (Array.isArray(procTrades) && procTrades.length)) {
+      try { renderPositions(); } catch {}
+      try { maybeFillOrders(); } catch {}
+    }
+
+    // If we still have backlog, continue next frame to avoid freezing the UI.
+    if (Array.isArray(remainder) && remainder.length) {
+      _pendingTrades = remainder;
+      _pendingMaxTs = maxTs; // keep the "true" max so the final frame can advance playhead fully
+      // Advance playhead only to what we actually processed so state stays consistent.
+      const lastProcTs = procTrades?.length ? procTrades[procTrades.length-1]?.ts_event : (book?.ts_event ?? null);
+      if (lastProcTs != null) updatePlayhead(lastProcTs);
+      _scheduleReplayFlush();
+      return;
+    }
+
+    if (maxTs != null) updatePlayhead(maxTs);
+  });
+}
+
 // Cross-tab control sync (popouts): pause/play/load in one tab controls the others.
 const TAB_ID = Math.random().toString(36).slice(2);
 const BC = ('BroadcastChannel' in window) ? new BroadcastChannel('sim-replay') : null;
@@ -486,7 +702,13 @@ function updatePlayhead(ns){
   if (!Number.isFinite(v)) return;
   if (playheadNs == null || v > playheadNs) {
     playheadNs = v;
-    setNow(`Now: ${nsToEt(playheadNs)} ET`);
+    // Perf: throttle "Now" label updates (Intl formatting + layout) during bursts.
+    // Only refresh if we crossed into a new second.
+    const sec = Math.floor(playheadNs / 1e9);
+    if (updatePlayhead._lastSec == null || sec !== updatePlayhead._lastSec) {
+      updatePlayhead._lastSec = sec;
+      setNow(`Now: ${nsToEt(playheadNs)} ET`);
+    }
     // Allow buffered candle updates (e.g., higher TF) to become visible only once complete.
     for (const ch of charts?.values?.() ?? []) {
       flushPendingCandles(ch);
@@ -526,19 +748,29 @@ window.addEventListener('unhandledrejection', (ev)=>{
 });
 
 const ET = 'America/New_York';
+// Perf: reuse Intl formatters (creating them and using formatToParts per tick is expensive).
+const _ET_DTF_FULL = new Intl.DateTimeFormat('en-CA', {
+  timeZone: ET,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false
+});
+const _ET_DTF_HMS = new Intl.DateTimeFormat('en-US', {
+  timeZone: ET,
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false
+});
 function nsToEt(ns){
   const ms = Math.floor(ns / 1e6);
   const d = new Date(ms);
-  const dtf = new Intl.DateTimeFormat('en-CA', {
-    timeZone: ET,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false
-  });
-  const parts = dtf.formatToParts(d);
-  const get = (t)=>parts.find(p=>p.type===t)?.value ?? '';
-  // en-CA gives YYYY-MM-DD ordering
-  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
+  // en-CA gives YYYY-MM-DD ordering; format() is much cheaper than formatToParts().
+  // Some runtimes include a comma between date and time; normalize to a single space.
+  return String(_ET_DTF_FULL.format(d)).replace(', ', ' ');
+}
+function nsToEtHms(ns){
+  const ms = Math.floor(ns / 1e6);
+  const d = new Date(ms);
+  return String(_ET_DTF_HMS.format(d));
 }
 
 function fmtPx(p){
@@ -550,6 +782,8 @@ function fmtPx(p){
 const L2_TIER_COLORS_KEY = 'sim-l2-tier-colors-v1';
 const L2_DEFAULT_TIER_COLORS = ['#ffd400', '#ffffff', '#31ff69', '#ff3b3b'];
 let l2TierColors = null;
+let _l2Dom = null; // cached DOM refs for incremental LVL2 updates
+let _l2TierBgCache = null; // array[10] -> {bidBg, askBg}
 
 function _isHexColor(s){
   return (typeof s === 'string') && /^#[0-9a-fA-F]{6}$/.test(s.trim());
@@ -579,6 +813,47 @@ function initL2Window(){
   const list = $('l2ColorsList');
   if (!gear || !panel || !list) return;
 
+  // Build LVL2 rows once and reuse DOM nodes (avoid innerHTML rebuild per tick).
+  (function ensureL2Dom(){
+    const tb = $('l2body');
+    if (!tb) return;
+    if (_l2Dom && _l2Dom.tb === tb && _l2Dom.rows && _l2Dom.rows.length === 10) return;
+    tb.innerHTML = '';
+    const rows = [];
+    for (let i=0; i<10; i++){
+      const tr = document.createElement('tr');
+      tr.className = 'l2row';
+      const bidPx = document.createElement('td'); bidPx.className = 'px bidx';
+      const bidSz = document.createElement('td'); bidSz.className = 'sz bidx';
+      const askPx = document.createElement('td'); askPx.className = 'px askx';
+      const askSz = document.createElement('td'); askSz.className = 'sz askx';
+      // keep the bold style, but do it once
+      bidPx.style.color = '#000'; bidPx.style.fontWeight = '1000';
+      bidSz.style.color = '#000'; bidSz.style.fontWeight = '1000';
+      askPx.style.color = '#000'; askPx.style.fontWeight = '1000';
+      askSz.style.color = '#000'; askSz.style.fontWeight = '1000';
+      tr.appendChild(bidPx); tr.appendChild(bidSz); tr.appendChild(askPx); tr.appendChild(askSz);
+      tb.appendChild(tr);
+      rows.push({tr, bidPx, bidSz, askPx, askSz});
+    }
+    _l2Dom = { tb, rows, meta: $('l2meta') };
+  })();
+
+  function _recomputeL2TierBgs(){
+    const colors = (Array.isArray(l2TierColors) && l2TierColors.length) ? l2TierColors : L2_DEFAULT_TIER_COLORS;
+    const bg = (hex, a)=> {
+      const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+      return `rgba(${r},${g},${b},${a})`;
+    };
+    _l2TierBgCache = [];
+    for (let i=0; i<10; i++){
+      const tier = colors[i % colors.length];
+      const c = bg(tier, 0.92);
+      _l2TierBgCache.push({bidBg: c, askBg: c});
+    }
+  }
+  _recomputeL2TierBgs();
+
   function openPanel(){ panel.style.display = 'block'; }
   function closePanel(){ panel.style.display = 'none'; }
   gear.addEventListener('click', (e)=>{ e.preventDefault(); (panel.style.display === 'block') ? closePanel() : openPanel(); });
@@ -604,6 +879,7 @@ function initL2Window(){
         if (_isHexColor(v)) {
           l2TierColors[idx] = v;
           saveL2TierColors();
+          _recomputeL2TierBgs();
           try { if (currentBook) renderL2(currentBook); } catch {}
         }
       });
@@ -612,6 +888,7 @@ function initL2Window(){
         if (idx <= 0) return;
         const tmp = l2TierColors[idx-1]; l2TierColors[idx-1] = l2TierColors[idx]; l2TierColors[idx] = tmp;
         saveL2TierColors(); rerenderColors();
+        _recomputeL2TierBgs();
         try { if (currentBook) renderL2(currentBook); } catch {}
       });
       row.querySelector('[data-act="dn"]')?.addEventListener('click', (e)=>{
@@ -619,6 +896,7 @@ function initL2Window(){
         if (idx >= l2TierColors.length-1) return;
         const tmp = l2TierColors[idx+1]; l2TierColors[idx+1] = l2TierColors[idx]; l2TierColors[idx] = tmp;
         saveL2TierColors(); rerenderColors();
+        _recomputeL2TierBgs();
         try { if (currentBook) renderL2(currentBook); } catch {}
       });
       row.querySelector('[data-act="rm"]')?.addEventListener('click', (e)=>{
@@ -626,6 +904,7 @@ function initL2Window(){
         if (l2TierColors.length <= 1) return;
         l2TierColors.splice(idx, 1);
         saveL2TierColors(); rerenderColors();
+        _recomputeL2TierBgs();
         try { if (currentBook) renderL2(currentBook); } catch {}
       });
       list.appendChild(row);
@@ -643,6 +922,7 @@ function initL2Window(){
     e.preventDefault();
     l2TierColors = [...L2_DEFAULT_TIER_COLORS];
     saveL2TierColors();
+    _recomputeL2TierBgs();
     rerenderColors();
     try { if (currentBook) renderL2(currentBook); } catch {}
   });
@@ -660,40 +940,34 @@ function initL2Window(){
 }
 
 function renderL2(book){
-  const tb = $('l2body');
-  tb.innerHTML = '';
-  const bids = book.bids || [];
-  const asks = book.asks || [];
-  // Bright background tier colors (user-configurable; loops).
-  const tierBgs = (Array.isArray(l2TierColors) && l2TierColors.length) ? l2TierColors : L2_DEFAULT_TIER_COLORS;
+  const bids = book?.bids || [];
+  const asks = book?.asks || [];
+  if (!_l2Dom || !_l2Dom.rows || _l2Dom.rows.length !== 10) {
+    try { initL2Window(); } catch {}
+  }
+  if (!_l2Dom || !_l2Dom.rows) return;
+  const bgs = Array.isArray(_l2TierBgCache) && _l2TierBgCache.length === 10 ? _l2TierBgCache : null;
   for (let i=0; i<10; i++){
     const b = bids[i] || [null, null];
     const a = asks[i] || [null, null];
-    const tr = document.createElement('tr');
-    tr.className = 'l2row';
-    // bright tier coloring per level (loops)
-    const tier = tierBgs[i % tierBgs.length];
-    const bg = (hex, a)=> {
-      const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
-      return `rgba(${r},${g},${b},${a})`;
-    };
-    const bidBg = bg(tier, 0.92);
-    const askBg = bg(tier, 0.92);
-    tr.innerHTML = `
-      <td class="px bidx" style="background:${bidBg}; color:#000; font-weight:1000">${fmtPx(b[0])}</td>
-      <td class="sz bidx" style="background:${bidBg}; color:#000; font-weight:1000">${b[1] ?? ''}</td>
-      <td class="px askx" style="background:${askBg}; color:#000; font-weight:1000">${fmtPx(a[0])}</td>
-      <td class="sz askx" style="background:${askBg}; color:#000; font-weight:1000">${a[1] ?? ''}</td>
-    `;
-    tb.appendChild(tr);
+    const row = _l2Dom.rows[i];
+    row.bidPx.textContent = fmtPx(b[0]);
+    row.bidSz.textContent = (b[1] == null) ? '' : String(b[1]);
+    row.askPx.textContent = fmtPx(a[0]);
+    row.askSz.textContent = (a[1] == null) ? '' : String(a[1]);
+    if (bgs) {
+      row.bidPx.style.background = bgs[i].bidBg;
+      row.bidSz.style.background = bgs[i].bidBg;
+      row.askPx.style.background = bgs[i].askBg;
+      row.askSz.style.background = bgs[i].askBg;
+    }
   }
   const bb = bids[0]?.[0], aa = asks[0]?.[0];
   const spr = (bb!=null && aa!=null) ? (aa - bb) : null;
   // Use the authoritative playhead time for display to avoid flicker/backwards jumps.
   const shownTs = (playheadNs != null) ? playheadNs : (book.ts_event ?? null);
-  $('l2meta').textContent = `ts_event=${shownTs ? nsToEt(shownTs) : ''} ET   bid=${fmtPx(bb)}   ask=${fmtPx(aa)}   spread=${spr!=null ? spr.toFixed(4) : ''}`;
-  try { renderPositions(); } catch {}
-  try { maybeFillOrders(); } catch {}
+  const meta = _l2Dom.meta || $('l2meta');
+  if (meta) meta.textContent = `ts_event=${shownTs ? nsToEt(shownTs) : ''} ET   bid=${fmtPx(bb)}   ask=${fmtPx(aa)}   spread=${spr!=null ? spr.toFixed(4) : ''}`;
 }
 
 function classifyTrade(price){
@@ -708,18 +982,39 @@ function appendTape(tr){
   const tape = $('tapeList');
   if (!tape) return;
   lastTrade = tr;
-  try { renderPositions(); } catch {}
-  try { maybeFillOrders(); } catch {}
-  try { maybeFillFromTrade(tr); } catch {}
   const line = document.createElement('div');
   const cls = classifyTrade(tr.price);
   line.className = 'tline ' + (cls === 'ask' ? 't-ask' : cls === 'bid' ? 't-bid' : 't-mid');
   line.innerHTML = `
-    <div class="ts">${nsToEt(tr.ts_event).slice(11,19)}</div>
+    <div class="ts">${nsToEtHms(tr.ts_event)}</div>
     <div>${fmtPx(tr.price)}</div>
     <div>${tr.size}</div>
   `;
   tape.prepend(line);
+  while (tape.childNodes.length > 250) tape.removeChild(tape.lastChild);
+}
+
+function appendTapeBatch(trades){
+  const tape = $('tapeList');
+  if (!tape) return;
+  if (!Array.isArray(trades) || trades.length === 0) return;
+  // Render newest at top (prepend). Building a fragment avoids repeated layout thrash.
+  const frag = document.createDocumentFragment();
+  for (let i=0; i<trades.length; i++){
+    const tr = trades[i];
+    if (!tr) continue;
+    lastTrade = tr;
+    const line = document.createElement('div');
+    const cls = classifyTrade(tr.price);
+    line.className = 'tline ' + (cls === 'ask' ? 't-ask' : cls === 'bid' ? 't-bid' : 't-mid');
+    line.innerHTML = `
+      <div class="ts">${nsToEtHms(tr.ts_event)}</div>
+      <div>${fmtPx(tr.price)}</div>
+      <div>${tr.size}</div>
+    `;
+    frag.appendChild(line);
+  }
+  tape.insertBefore(frag, tape.firstChild);
   while (tape.childNodes.length > 250) tape.removeChild(tape.lastChild);
 }
 
@@ -807,6 +1102,11 @@ function tvInit(chart){
     return String(time ?? '');
   }
 
+  function _tvTickMarkFormatter(time /*, tickMarkType, locale */){
+    // Tick labels (x-axis) use tickMarkFormatter, not timeFormatter, in Lightweight Charts.
+    return _tvTimeFormatter(time);
+  }
+
   function _tvAddCandles(api, options){
     // v3/v4: api.addCandlestickSeries
     if (api && typeof api.addCandlestickSeries === 'function') return api.addCandlestickSeries(options);
@@ -838,12 +1138,20 @@ function tvInit(chart){
       layout: { background: { color: '#0b1220' }, textColor: 'rgba(230,237,243,0.9)' },
       grid: { vertLines: { color: 'rgba(34,48,69,0.55)' }, horzLines: { color: 'rgba(34,48,69,0.55)' } },
       rightPriceScale: { borderColor: 'rgba(34,48,69,0.8)' },
-      timeScale: { borderColor: 'rgba(34,48,69,0.8)', timeVisible: true, secondsVisible: true },
+      timeScale: {
+        borderColor: 'rgba(34,48,69,0.8)',
+        timeVisible: true,
+        secondsVisible: (chart.tf === '1s' || chart.tf === '10s'),
+        tickMarkFormatter: _tvTickMarkFormatter,
+      },
       crosshair: (_tvCrosshairModeNormal() != null) ? { mode: _tvCrosshairModeNormal() } : undefined,
       localization: { timeFormatter: _tvTimeFormatter },
     });
     // Some versions use applyOptions for localization; do both, safely.
-    try { chart.tv.applyOptions({ localization: { timeFormatter: _tvTimeFormatter } }); } catch {}
+    try { chart.tv.applyOptions({
+      localization: { timeFormatter: _tvTimeFormatter },
+      timeScale: { tickMarkFormatter: _tvTickMarkFormatter, secondsVisible: (chart.tf === '1s' || chart.tf === '10s') },
+    }); } catch {}
   } catch (e) {
     const msg = `LightweightCharts.createChart failed: ${e?.message ?? e}`;
     console.error(msg, e);
@@ -1079,14 +1387,30 @@ function tvEnsureIndicators(chart){
     chart.macdWrap.style.display = 'block';
     if (!chart.macdTv) {
       try {
+        const _macdTimeFmt = (t)=> {
+          if (typeof t === 'number') {
+            const showSeconds = (chart.tf === '1s' || chart.tf === '10s');
+            const opts = showSeconds
+              ? { timeZone: ET, hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }
+              : { timeZone: ET, hour:'2-digit', minute:'2-digit', hour12:false };
+            return new Intl.DateTimeFormat('en-US', opts).format(new Date(t*1000));
+          }
+          return String(t ?? '');
+        };
+        const _macdTickFmt = (t /*, tickMarkType, locale */)=> _macdTimeFmt(t);
         chart.macdTv = LightweightCharts.createChart(chart.macdContainer, {
           layout: { background: { color: '#0b1220' }, textColor: 'rgba(230,237,243,0.85)' },
           grid: { vertLines: { color: 'rgba(34,48,69,0.55)' }, horzLines: { color: 'rgba(34,48,69,0.55)' } },
           rightPriceScale: { borderColor: 'rgba(34,48,69,0.8)' },
-          timeScale: { borderColor: 'rgba(34,48,69,0.8)', timeVisible: true, secondsVisible: true },
+          timeScale: {
+            borderColor: 'rgba(34,48,69,0.8)',
+            timeVisible: true,
+            secondsVisible: (chart.tf === '1s' || chart.tf === '10s'),
+            tickMarkFormatter: _macdTickFmt,
+          },
           handleScroll: false,
           handleScale: false,
-          localization: { timeFormatter: (t)=> (typeof t === 'number' ? (new Intl.DateTimeFormat('en-US', {timeZone: ET, hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}).format(new Date(t*1000))) : String(t)) },
+          localization: { timeFormatter: _macdTimeFmt },
         });
       } catch (e) {
         console.error('MACD chart create failed', e);
@@ -1550,6 +1874,8 @@ function captureLayout(){
   document.querySelectorAll('.win').forEach(w=>{
     const id = w.id;
     if (!id) return;
+    // Windows explicitly "closed" via the X button should not be persisted in layout at all.
+    if (w?.dataset?.closed === '1') return;
     wins[id] = {
       x: _numPx(w.style.left, 0),
       y: _numPx(w.style.top, 0),
@@ -1564,6 +1890,7 @@ function captureLayout(){
     for (const ch of charts.values()){
       const w = ch?.win;
       if (!w) continue;
+      if (w?.dataset?.closed === '1') continue;
       chartLayouts.push({
         id: ch.id,
         tf: ch.tf,
@@ -3418,6 +3745,8 @@ function createChartWindow(tf){
     h: 680,
     bodyHtml: makeChartHtml(id)
   });
+  // Chart-specific window behavior (edge-drag handles, etc.)
+  try { win.classList.add('chartWin'); } catch {}
   const wrap = win.querySelector('.chartWrap');
   const container = win.querySelector('.tvMain');
   const macdWrap = win.querySelector('.tvMacdWrap');
@@ -3479,6 +3808,7 @@ function createChartWindow(tf){
   tvInit(chart);
   const ro = new ResizeObserver(()=> tvResize(chart));
   ro.observe(wrap);
+  chart._ro = ro;
   function setTf(tfNext){
     chart.tf = tfNext;
     win.querySelector('.wlabel').textContent = `Chart (${chart.tf})`;
@@ -3488,12 +3818,17 @@ function createChartWindow(tf){
       b.style.background = on ? '#14304f' : '#0f1723';
       b.style.borderColor = on ? '#2f5a8a' : 'var(--grid)';
     });
+    // Update seconds visibility for axis labels (1s/10s only)
+    try { chart.tv?.applyOptions?.({ timeScale: { secondsVisible: (tfNext === '1s' || tfNext === '10s') } }); } catch {}
+    try { chart.macdTv?.applyOptions?.({ timeScale: { secondsVisible: (tfNext === '1s' || tfNext === '10s') } }); } catch {}
   }
   setTf(tf);
 
   win.querySelectorAll('.tfBtn').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       const next = btn.getAttribute('data-tf') || '1s';
+      // Stop old TF candle stream immediately to avoid mixing old/new TF updates while the snapshot loads.
+      try { if (chart.sse) { chart.sse.close(); chart.sse = null; } } catch {}
       setTf(next);
       await loadChartSnapshot(chart);
       if (!isPaused && playheadNs != null) startChartStream(chart, playheadNs);
@@ -3810,7 +4145,14 @@ async function loadSnapshot(){
   const tl = $('tapeList');
   if (tl) tl.innerHTML = '';
   // Snapshot trades are in ascending time; prepend oldest->newest so newest ends up at top.
-  for (const tr of (data.trades || [])) appendTape(tr);
+  try {
+    const ts = Array.isArray(data.trades) ? data.trades : [];
+    const copy = ts.slice();
+    copy.reverse(); // newest-first for appendTapeBatch
+    appendTapeBatch(copy);
+  } catch {
+    for (const tr of (data.trades || [])) appendTape(tr);
+  }
   // Seed session-like quote stats from the snapshot candle window (best-effort).
   try {
     const cs = Array.isArray(data.candles) ? data.candles : [];
@@ -3838,6 +4180,10 @@ async function loadSnapshot(){
   resetTapeMonotonic(playheadNs);
   // If user "rewound" by loading an earlier snapshot, prune trading state to match.
   try { resetTradingToTime(playheadNs); } catch {}
+  // Ensure trading UI reflects the reset state (renderL2 no longer triggers these).
+  try { renderPositions(); } catch {}
+  try { renderOpenOrders(); } catch {}
+  try { renderHistory(); } catch {}
   // update all charts
   for (const ch of charts.values()){
     await loadChartSnapshot(ch);
@@ -3872,34 +4218,35 @@ function startBookTapeStream(tsNs){
   sseBookTape = new EventSource(`/api/stream?symbol=${encodeURIComponent(symbol)}&day=${encodeURIComponent(day)}&ts_ns=${encodeURIComponent(tsNs)}&speed=${encodeURIComponent(speed)}&tf=1s&what=booktrades`);
   sseBookTape.onmessage = (ev)=>{
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'book'){
-      currentBook = msg;
-      renderL2(currentBook);
-      updatePlayhead(msg.ts_event);
-    } else if (msg.type === 'trade'){
-      // Guard against rewinds (e.g., resume from an older playhead) which makes the tape "jump backwards".
-      if (lastTapeTsSeen != null && msg.ts_event < lastTapeTsSeen) return;
-      lastTapeTsSeen = msg.ts_event;
-      // Update quote-like stats (best-effort)
-      try {
-        lastTrade = msg;
-        const px = Number(msg.price);
-        if (Number.isFinite(px)) {
-          if (sessionStats.open == null) sessionStats.open = px;
-          sessionStats.hi = (sessionStats.hi == null) ? px : Math.max(sessionStats.hi, px);
-          sessionStats.lo = (sessionStats.lo == null) ? px : Math.min(sessionStats.lo, px);
-        }
-      } catch {}
-      appendTape(msg);
-      updatePlayhead(msg.ts_event);
-      // drive higher-TF charts' in-progress bar close/high/low/volume in real-time
-      for (const ch of charts.values()) {
-        updateChartFromTrade(ch, Number(msg.ts_event), Number(msg.price), Number(msg.size));
+    const handleOne = (m)=>{
+      if (!m || !m.type) return;
+      if (m.type === 'book'){
+        _pendingBook = m;
+        _pendingMaxTs = (_pendingMaxTs == null) ? m.ts_event : Math.max(Number(_pendingMaxTs), Number(m.ts_event));
+        _scheduleReplayFlush();
+      } else if (m.type === 'trade'){
+        // Update quote-like stats (best-effort)
+        try {
+          const px = Number(m.price);
+          if (Number.isFinite(px)) {
+            if (sessionStats.open == null) sessionStats.open = px;
+            sessionStats.hi = (sessionStats.hi == null) ? px : Math.max(sessionStats.hi, px);
+            sessionStats.lo = (sessionStats.lo == null) ? px : Math.min(sessionStats.lo, px);
+          }
+        } catch {}
+        _pendingTrades.push(m);
+        _pendingMaxTs = (_pendingMaxTs == null) ? m.ts_event : Math.max(Number(_pendingMaxTs), Number(m.ts_event));
+        _scheduleReplayFlush();
+      } else if (m.type === 'eos'){
+        setStatus('Paused (end of data)');
+        stopStream();
+        isPaused = true;
       }
-    } else if (msg.type === 'eos'){
-      setStatus('Paused (end of data)');
-      stopStream();
-      isPaused = true;
+    };
+    if (msg.type === 'batch' && Array.isArray(msg.items)){
+      for (const it of msg.items) handleOne(it);
+    } else {
+      handleOne(msg);
     }
   };
   sseBookTape.onerror = async ()=>{
@@ -3919,8 +4266,16 @@ function startChartStream(chart, tsNs){
   chart.sse = new EventSource(`/api/stream?symbol=${encodeURIComponent(symbol)}&day=${encodeURIComponent(day)}&ts_ns=${encodeURIComponent(tsNs)}&speed=${encodeURIComponent(speed)}&tf=${encodeURIComponent(chart.tf)}&what=candles`);
   chart.sse.onmessage = (ev)=>{
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'candle') upsertCandle(chart, msg);
-    if (msg.type === 'eos') { chart.sse?.close(); chart.sse=null; }
+    const handleOne = (m)=>{
+      if (!m || !m.type) return;
+      if (m.type === 'candle') upsertCandle(chart, m);
+      if (m.type === 'eos') { chart.sse?.close(); chart.sse=null; }
+    };
+    if (msg.type === 'batch' && Array.isArray(msg.items)){
+      for (const it of msg.items) handleOne(it);
+    } else {
+      handleOne(msg);
+    }
   };
   chart.sse.onerror = ()=>{
     // leave global stream alone; show error once
@@ -3941,8 +4296,15 @@ async function loadChartSnapshot(chart){
   if (!resp.ok){
     const detail = data?.detail || 'Failed to load chart';
     setErr(detail);
-    // fallback chart TF to 1s if missing parquet
-    if (String(detail).toLowerCase().includes('missing parquet') && chart.tf !== '1s'){
+    // Fallback chart TF to 1s if higher-TF candles are unavailable (missing or empty parquet).
+    const d = String(detail).toLowerCase();
+    if (chart.tf !== '1s' && (
+      d.includes('missing parquet') ||
+      d.includes('no ohlcv') ||
+      d.includes('ohlcv parquet is empty') ||
+      d.includes('0 rows matched') ||
+      d.includes('selected time does not exist in data range')
+    )){
       chart.tf = '1s';
       chart.win.querySelector('.wlabel').textContent = `Chart (1s)`;
       return await loadChartSnapshot(chart);
@@ -4056,6 +4418,9 @@ if (QS.get('symbol')) $('symbol').value = QS.get('symbol');
 if (QS.get('day')) $('day').value = QS.get('day');
 if (QS.get('ts')) $('ts').value = QS.get('ts');
 if (QS.get('speed')) $('speed').value = QS.get('speed');
+
+// Populate session catalog (non-blocking; user can still type manual symbol/day/time).
+initCatalogDropdown();
 
 // Create windows
 makeWindow({
@@ -4195,6 +4560,7 @@ function openPopout(id){
 function spawnWindowInPage(id){
   const w = document.getElementById(id);
   if (!w) return;
+  try { if (w.dataset?.closed === '1') delete w.dataset.closed; } catch {}
   w.style.display = 'block';
   // nudge so repeated spawns are visible
   const x = _numPx(w.style.left, 10);
@@ -4537,11 +4903,35 @@ def _load_day(symbol: str, day: str, data_dir: Path, tz_name: str, tf: str) -> L
     # OHLCV timestamp column name differs by dataset/timeframe:
     # - Some files use `ts_event` (common in Databento schemas)
     # - Others use `ts` (observed in generated/aggregated OHLCV parquet)
-    ohl_schema_names = pq.ParquetFile(ohl_path).schema.names
+    ohl_pf = pq.ParquetFile(ohl_path)
+    ohl_schema_names = ohl_pf.schema.names
     ohl_ts_col = "ts_event" if "ts_event" in ohl_schema_names else "ts"
     ohl_cols = [ohl_ts_col, "symbol", "open", "high", "low", "close", "volume"]
     ohl = _read_parquet_cols(ohl_path, ohl_cols)
     ohl_keep = [i for i, s in enumerate(ohl["symbol"]) if s == symbol]
+    if not ohl_keep:
+        try:
+            nrows = int(getattr(getattr(ohl_pf, "metadata", None), "num_rows", 0) or 0)
+        except Exception:
+            nrows = 0
+        if nrows <= 0:
+            raise ValueError(
+                f"OHLCV parquet is empty: {ohl_path} (tf={tf}). "
+                f"This typically happens when higher-timeframe bars were built from sparse 1s input and all buckets were dropped. "
+                f"Try tf=1s/10s or rebuild bars."
+            )
+        # Parquet has rows, but none matched this symbol.
+        sample_syms: List[str] = []
+        try:
+            # Sample from the first row group to keep this lightweight.
+            rg0 = ohl_pf.read_row_group(0, columns=["symbol"])
+            sample_syms = sorted(set(rg0["symbol"].to_pylist()))[:20]
+        except Exception:
+            sample_syms = []
+        raise ValueError(
+            f"OHLCV parquet has {nrows} rows but 0 rows matched symbol={symbol!r}: {ohl_path} (tf={tf}). "
+            + (f"Sample symbols: {sample_syms}" if sample_syms else "Could not sample symbols.")
+        )
     ohl_ts = [_ts_to_ns(ohl[ohl_ts_col][i]) for i in ohl_keep]
     ohl_o = [ohl["open"][i] for i in ohl_keep]
     ohl_h = [ohl["high"][i] for i in ohl_keep]
@@ -4804,6 +5194,49 @@ def metadata(
     )
 
 
+@APP.get("/api/catalog")
+def catalog(
+    data_dir: str = Query(str(DATA_DIR_DEFAULT)),
+    tz_name: str = Query(LOCAL_TZ_NAME_DEFAULT),
+    limit: int = Query(250, ge=1, le=2000),
+):
+    """
+    Scan databento_out for applicable days/symbols and return a session list for the UI dropdown.
+    Each entry includes the earliest bar timestamp (per symbol/day) in ET for quick "practice" loads.
+    """
+    key = (str(data_dir), str(tz_name), int(limit))
+    now = time.time()
+    cached = _CATALOG_CACHE.get(key)
+    if cached and (now - float(cached[0])) < _CATALOG_CACHE_TTL_S:
+        return JSONResponse(cached[1])
+
+    try:
+        from DataCatalog import scan_catalog  # Simulator/DataCatalog.py (local module)
+
+        items = scan_catalog(Path(data_dir), tz_name=tz_name)
+        if limit:
+            items = items[: int(limit)]
+        payload: Dict[str, Any] = {
+            "data_dir": str(Path(data_dir)),
+            "tz_name": tz_name,
+            "items": [
+                {
+                    "symbol": it.symbol,
+                    "day": it.day,
+                    "start_ts_ns": int(it.start_ts_ns),
+                    "start_et": it.start_et,
+                    "label": it.label,
+                }
+                for it in items
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    _CATALOG_CACHE[key] = (now, payload)
+    return JSONResponse(payload)
+
+
 @APP.get("/api/snapshot")
 def snapshot(
     symbol: str = Query(...),
@@ -4932,6 +5365,30 @@ async def _aiter_stream(
     def emit(obj: Dict[str, Any]) -> bytes:
         return f"data: {json.dumps(obj, separators=(',',':'))}\n\n".encode("utf-8")
 
+    def _book_msg(i: int) -> Dict[str, Any]:
+        bids = [[_price_to_float(day.bid_px[i][j]), int(day.bid_sz[i][j])] for j in range(10)]
+        asks = [[_price_to_float(day.ask_px[i][j]), int(day.ask_sz[i][j])] for j in range(10)]
+        return {"type": "book", "ts_event": int(day.mbp_ts[i]), "bids": bids, "asks": asks}
+
+    def _trade_msg(i: int) -> Dict[str, Any]:
+        return {
+            "type": "trade",
+            "ts_event": int(day.trd_ts[i]),
+            "price": _price_to_float(day.trd_px[i]),
+            "size": int(day.trd_sz[i]),
+        }
+
+    def _candle_msg(i: int) -> Dict[str, Any]:
+        return {
+            "type": "candle",
+            "t": int(day.ohl_ts[i]),
+            "o": _price_to_float(day.ohl_o[i]),
+            "h": _price_to_float(day.ohl_h[i]),
+            "l": _price_to_float(day.ohl_l[i]),
+            "c": _price_to_float(day.ohl_c[i]),
+            "v": int(day.ohl_v[i]),
+        }
+
     while True:
         if await request.is_disconnected():
             return
@@ -4969,34 +5426,31 @@ async def _aiter_stream(
             await asyncio.sleep(chunk)
             remaining -= chunk
 
-        if src == "b":
-            bids = [[_price_to_float(day.bid_px[i_b][j]), int(day.bid_sz[i_b][j])] for j in range(10)]
-            asks = [[_price_to_float(day.ask_px[i_b][j]), int(day.ask_sz[i_b][j])] for j in range(10)]
-            yield emit({"type": "book", "ts_event": int(day.mbp_ts[i_b]), "bids": bids, "asks": asks})
-            i_b += 1
-        elif src == "t":
-            yield emit(
-                {
-                    "type": "trade",
-                    "ts_event": int(day.trd_ts[i_t]),
-                    "price": _price_to_float(day.trd_px[i_t]),
-                    "size": int(day.trd_sz[i_t]),
-                }
-            )
-            i_t += 1
-        else:  # "c"
-            yield emit(
-                {
-                    "type": "candle",
-                    "t": int(day.ohl_ts[i_c]),
-                    "o": _price_to_float(day.ohl_o[i_c]),
-                    "h": _price_to_float(day.ohl_h[i_c]),
-                    "l": _price_to_float(day.ohl_l[i_c]),
-                    "c": _price_to_float(day.ohl_c[i_c]),
-                    "v": int(day.ohl_v[i_c]),
-                }
-            )
-            i_c += 1
+        # Performance: batch all events that share the same timestamp into a single SSE message.
+        # Bursty moments often have many events with dt=0; emitting them one-by-one overwhelms the browser
+        # event loop and causes visible "freezes" followed by catch-up jumps.
+        items: List[Dict[str, Any]] = []
+        ts0 = int(next_ts)
+        # Preserve the same deterministic tie ordering as the single-event stream: book, then trade, then candle.
+        if what in ("all", "booktrades"):
+            while i_b < len(day.mbp_ts) and int(day.mbp_ts[i_b]) == ts0:
+                items.append(_book_msg(i_b))
+                i_b += 1
+            while i_t < len(day.trd_ts) and int(day.trd_ts[i_t]) == ts0:
+                items.append(_trade_msg(i_t))
+                i_t += 1
+        if what in ("all", "candles"):
+            while i_c < len(day.ohl_ts) and int(day.ohl_ts[i_c]) == ts0:
+                items.append(_candle_msg(i_c))
+                i_c += 1
+
+        if not items:
+            # Shouldn't happen, but keep the stream moving.
+            continue
+        if len(items) == 1:
+            yield emit(items[0])
+        else:
+            yield emit({"type": "batch", "ts_event": ts0, "items": items})
 
 
 @APP.get("/api/stream")
