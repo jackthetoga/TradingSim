@@ -96,26 +96,46 @@ INDEX_HTML = r"""
 
     /* LVL2 */
     table.l2 { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-    table.l2 th, table.l2 td { font-size: 12px; padding: 3px 6px; border-bottom: 1px solid rgba(34,48,69,0.55); }
+    table.l2 th, table.l2 td { font-size: 15px; padding: 4px 8px; border-bottom: 1px solid rgba(34,48,69,0.55); }
     table.l2 th { color: var(--muted); font-weight: 600; }
     table.l2 td { white-space: nowrap; }
-    .l2row { height: 22px; }
+    .l2row { height: 26px; }
     .bidx { text-align: right; }
     .askx { text-align: left; }
-    .px { width: 74px; }
-    .sz { width: 58px; }
+    .px { width: 88px; }
+    .sz { width: 70px; }
     .lvl { width: 34px; color: var(--muted); }
-    .center { text-align: center; }
     .meta { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .l2Wrap { position: relative; }
+    .l2TopRow { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-bottom: 8px; }
+    .l2Gear { width: 30px; height: 30px; border-radius: 10px; background:#0f1723; border:1px solid var(--grid); color:var(--fg); cursor:pointer; display:flex; align-items:center; justify-content:center; }
+    .l2Panel {
+      position:absolute; right: 0; top: 0;
+      width: 300px; max-width: calc(100% - 8px);
+      border: 1px solid var(--grid); border-radius: 12px;
+      background: rgba(15,23,35,0.96);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+      padding: 10px;
+      display:none;
+      z-index: 1000;
+    }
+    .l2PanelTitle { color: var(--muted); font-size: 12px; font-weight: 900; margin-bottom: 8px; }
+    .l2ColorsList { display:flex; flex-direction:column; gap: 8px; }
+    .l2ColorRow { display:flex; align-items:center; gap: 8px; }
+    .l2ColorIdx { color: var(--muted); font-size: 12px; width: 22px; text-align:right; font-variant-numeric: tabular-nums; }
+    .l2ColorRow input[type="color"] { width: 44px; height: 30px; padding: 0; border: 1px solid var(--grid); background:#0f1723; border-radius: 10px; }
+    .l2PanelBtns { display:flex; flex-wrap:wrap; gap: 8px; margin-top: 10px; }
+    .l2Small { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
     /* Tape */
     /* NOTE: keep tape window id as `tape` (for popout), but the scroll container is `tapeList`. */
-    #tapeList { height: 360px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; }
-    .tline { padding: 2px 6px; border-bottom: 1px solid rgba(34,48,69,0.35); display: grid; grid-template-columns: 140px 1fr 1fr; gap: 10px; }
-    .tline .ts { color: #000; font-weight: 900; }
-    .t-ask { color: #000; background: rgba(37,211,102,0.85); font-weight: 800; }
-    .t-bid { color: #000; background: rgba(170,40,40,0.75); font-weight: 800; }
-    .t-mid { color: #000; background: rgba(160,160,160,0.65); font-weight: 800; }
+    #tapeList { height: 360px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 14px; background: #000; }
+    .tline { padding: 3px 8px; border-bottom: 1px solid rgba(34,48,69,0.35); display: grid; grid-template-columns: 140px 1fr 1fr; gap: 10px; background: #000; }
+    .tline .ts { color: inherit; opacity: 0.9; font-weight: 900; }
+    /* Keep the same trade classification rules, but move the color to the font (background stays black). */
+    .t-ask { color: rgba(37,211,102,0.95); font-weight: 900; }
+    .t-bid { color: rgba(255,77,77,0.92); font-weight: 900; }
+    .t-mid { color: rgba(200,200,200,0.85); font-weight: 900; }
 
     /* Chart */
     #chartWrap { height: 560px; }
@@ -526,13 +546,126 @@ function fmtPx(p){
   return Number(p).toFixed(4);
 }
 
+// ---------------- LVL2 appearance settings ----------------
+const L2_TIER_COLORS_KEY = 'sim-l2-tier-colors-v1';
+const L2_DEFAULT_TIER_COLORS = ['#ffd400', '#ffffff', '#31ff69', '#ff3b3b'];
+let l2TierColors = null;
+
+function _isHexColor(s){
+  return (typeof s === 'string') && /^#[0-9a-fA-F]{6}$/.test(s.trim());
+}
+
+function loadL2TierColors(){
+  try {
+    const raw = localStorage.getItem(L2_TIER_COLORS_KEY);
+    if (!raw) return [...L2_DEFAULT_TIER_COLORS];
+    const v = JSON.parse(raw);
+    if (!Array.isArray(v)) return [...L2_DEFAULT_TIER_COLORS];
+    const out = v.map(x=>String(x).trim()).filter(_isHexColor);
+    return (out.length > 0) ? out : [...L2_DEFAULT_TIER_COLORS];
+  } catch {
+    return [...L2_DEFAULT_TIER_COLORS];
+  }
+}
+
+function saveL2TierColors(){
+  try { localStorage.setItem(L2_TIER_COLORS_KEY, JSON.stringify(l2TierColors || [])); } catch {}
+}
+
+function initL2Window(){
+  l2TierColors = loadL2TierColors();
+  const gear = $('l2Gear');
+  const panel = $('l2Panel');
+  const list = $('l2ColorsList');
+  if (!gear || !panel || !list) return;
+
+  function openPanel(){ panel.style.display = 'block'; }
+  function closePanel(){ panel.style.display = 'none'; }
+  gear.addEventListener('click', (e)=>{ e.preventDefault(); (panel.style.display === 'block') ? closePanel() : openPanel(); });
+  $('l2ColorClose')?.addEventListener('click', (e)=>{ e.preventDefault(); closePanel(); });
+
+  function rerenderColors(){
+    if (!list) return;
+    list.innerHTML = '';
+    const colors = (Array.isArray(l2TierColors) && l2TierColors.length) ? l2TierColors : [...L2_DEFAULT_TIER_COLORS];
+    colors.forEach((hex, idx)=>{
+      const row = document.createElement('div');
+      row.className = 'l2ColorRow';
+      row.innerHTML = `
+        <div class="l2ColorIdx">${idx+1}</div>
+        <input type="color" value="${hex}">
+        <button class="wbtn" data-act="up" title="Move up">↑</button>
+        <button class="wbtn" data-act="dn" title="Move down">↓</button>
+        <button class="wbtn" data-act="rm" title="Remove">✕</button>
+      `;
+      const inp = row.querySelector('input[type="color"]');
+      inp?.addEventListener('input', ()=>{
+        const v = String(inp.value || '').trim();
+        if (_isHexColor(v)) {
+          l2TierColors[idx] = v;
+          saveL2TierColors();
+          try { if (currentBook) renderL2(currentBook); } catch {}
+        }
+      });
+      row.querySelector('[data-act="up"]')?.addEventListener('click', (e)=>{
+        e.preventDefault();
+        if (idx <= 0) return;
+        const tmp = l2TierColors[idx-1]; l2TierColors[idx-1] = l2TierColors[idx]; l2TierColors[idx] = tmp;
+        saveL2TierColors(); rerenderColors();
+        try { if (currentBook) renderL2(currentBook); } catch {}
+      });
+      row.querySelector('[data-act="dn"]')?.addEventListener('click', (e)=>{
+        e.preventDefault();
+        if (idx >= l2TierColors.length-1) return;
+        const tmp = l2TierColors[idx+1]; l2TierColors[idx+1] = l2TierColors[idx]; l2TierColors[idx] = tmp;
+        saveL2TierColors(); rerenderColors();
+        try { if (currentBook) renderL2(currentBook); } catch {}
+      });
+      row.querySelector('[data-act="rm"]')?.addEventListener('click', (e)=>{
+        e.preventDefault();
+        if (l2TierColors.length <= 1) return;
+        l2TierColors.splice(idx, 1);
+        saveL2TierColors(); rerenderColors();
+        try { if (currentBook) renderL2(currentBook); } catch {}
+      });
+      list.appendChild(row);
+    });
+  }
+
+  $('l2ColorAdd')?.addEventListener('click', (e)=>{
+    e.preventDefault();
+    l2TierColors = (Array.isArray(l2TierColors) ? l2TierColors : [...L2_DEFAULT_TIER_COLORS]);
+    l2TierColors.push('#ffffff');
+    saveL2TierColors();
+    rerenderColors();
+  });
+  $('l2ColorReset')?.addEventListener('click', (e)=>{
+    e.preventDefault();
+    l2TierColors = [...L2_DEFAULT_TIER_COLORS];
+    saveL2TierColors();
+    rerenderColors();
+    try { if (currentBook) renderL2(currentBook); } catch {}
+  });
+
+  // Close if user clicks outside the panel (within the LVL2 window body).
+  const l2win = $('l2');
+  l2win?.addEventListener('mousedown', (ev)=>{
+    if (!panel || panel.style.display !== 'block') return;
+    const t = ev.target;
+    if (t && (panel.contains(t) || gear.contains(t))) return;
+    closePanel();
+  });
+
+  rerenderColors();
+}
+
 function renderL2(book){
   const tb = $('l2body');
   tb.innerHTML = '';
   const bids = book.bids || [];
   const asks = book.asks || [];
-  // Bright background tier colors: yellow, white, green, red (loops)
-  const tierBgs = ['#ffd400', '#ffffff', '#31ff69', '#ff3b3b'];
+  // Bright background tier colors (user-configurable; loops).
+  const tierBgs = (Array.isArray(l2TierColors) && l2TierColors.length) ? l2TierColors : L2_DEFAULT_TIER_COLORS;
   for (let i=0; i<10; i++){
     const b = bids[i] || [null, null];
     const a = asks[i] || [null, null];
@@ -547,11 +680,10 @@ function renderL2(book){
     const bidBg = bg(tier, 0.92);
     const askBg = bg(tier, 0.92);
     tr.innerHTML = `
-      <td class="sz bidx" style="background:${bidBg}; color:#000; font-weight:900">${b[1] ?? ''}</td>
-      <td class="px bidx" style="background:${bidBg}; color:#000; font-weight:900">${fmtPx(b[0])}</td>
-      <td class="center" style="color: var(--muted)">|</td>
-      <td class="px askx" style="background:${askBg}; color:#000; font-weight:900">${fmtPx(a[0])}</td>
-      <td class="sz askx" style="background:${askBg}; color:#000; font-weight:900">${a[1] ?? ''}</td>
+      <td class="px bidx" style="background:${bidBg}; color:#000; font-weight:1000">${fmtPx(b[0])}</td>
+      <td class="sz bidx" style="background:${bidBg}; color:#000; font-weight:1000">${b[1] ?? ''}</td>
+      <td class="px askx" style="background:${askBg}; color:#000; font-weight:1000">${fmtPx(a[0])}</td>
+      <td class="sz askx" style="background:${askBg}; color:#000; font-weight:1000">${a[1] ?? ''}</td>
     `;
     tb.appendChild(tr);
   }
@@ -3931,21 +4063,37 @@ makeWindow({
   title: 'LVL2 (Top 10)',
   x: 12, y: 12, w: 420, h: 380,
   bodyHtml: `
-    <table class="l2">
-      <thead>
-        <tr>
-          <th class="sz bidx">Bid Sz</th>
-          <th class="px bidx">Bid Px</th>
-          <th class="center" style="width:14px;"></th>
-          <th class="px askx">Ask Px</th>
-          <th class="sz askx">Ask Sz</th>
-        </tr>
-      </thead>
-      <tbody id="l2body"></tbody>
-    </table>
-    <div class="meta" id="l2meta"></div>
+    <div class="l2Wrap">
+      <div class="l2TopRow">
+        <button class="l2Gear" id="l2Gear" title="LVL2 color settings">⚙</button>
+      </div>
+      <div class="l2Panel" id="l2Panel">
+        <div class="l2PanelTitle">LVL2 Tier Colors</div>
+        <div class="l2ColorsList" id="l2ColorsList"></div>
+        <div class="l2PanelBtns">
+          <button class="wbtn" id="l2ColorAdd">Add</button>
+          <button class="wbtn" id="l2ColorReset">Reset</button>
+          <button class="wbtn" id="l2ColorClose">Close</button>
+        </div>
+        <div class="l2Small">Applied by level (row 1..10), looping through the list.</div>
+      </div>
+
+      <table class="l2">
+        <thead>
+          <tr>
+            <th class="px bidx">Bid Px</th>
+            <th class="sz bidx">Bid Sz</th>
+            <th class="px askx">Ask Px</th>
+            <th class="sz askx">Ask Sz</th>
+          </tr>
+        </thead>
+        <tbody id="l2body"></tbody>
+      </table>
+      <div class="meta" id="l2meta"></div>
+    </div>
   `
 });
+initL2Window();
 
 makeWindow({
   id: 'tape',
