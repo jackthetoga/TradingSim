@@ -1004,7 +1004,6 @@ function classifyTrade(price){
 function appendTape(tr){
   const tape = $('tapeList');
   if (!tape) return;
-  lastTrade = tr;
   const line = document.createElement('div');
   const cls = classifyTrade(tr.price);
   line.className = 'tline ' + (cls === 'ask' ? 't-ask' : cls === 'bid' ? 't-bid' : 't-mid');
@@ -1026,7 +1025,6 @@ function appendTapeBatch(trades){
   for (let i=0; i<trades.length; i++){
     const tr = trades[i];
     if (!tr) continue;
-    lastTrade = tr;
     const line = document.createElement('div');
     const cls = classifyTrade(tr.price);
     line.className = 'tline ' + (cls === 'ask' ? 't-ask' : cls === 'bid' ? 't-bid' : 't-mid');
@@ -4172,6 +4170,8 @@ async function loadSnapshot(){
   const symbol = $('symbol').value.trim();
   const day = $('day').value.trim();
   const ts = $('ts').value.trim();
+  // IMPORTANT: reset per-symbol/session state so we don't seed charts with stale data.
+  lastTrade = null;
   // Use 1s as the authoritative playhead bucket; each chart has its own TF selector.
   const resp = await fetch(`/api/snapshot?symbol=${encodeURIComponent(symbol)}&day=${encodeURIComponent(day)}&ts=${encodeURIComponent(ts)}&tf=1s`);
   const data = await resp.json();
@@ -4185,6 +4185,21 @@ async function loadSnapshot(){
   renderL2(currentBook);
   const tl = $('tapeList');
   if (tl) tl.innerHTML = '';
+  // Set lastTrade from the snapshot payload (newest by ts_event) BEFORE we load chart snapshots.
+  // (Tape rendering order can be newest-first and must not clobber lastTrade.)
+  try {
+    const trs = Array.isArray(data.trades) ? data.trades : [];
+    let best = null;
+    for (const tr of trs){
+      if (!tr) continue;
+      const t = Number(tr.ts_event);
+      if (!Number.isFinite(t)) continue;
+      if (!best || t > Number(best.ts_event)) best = tr;
+    }
+    lastTrade = best;
+  } catch {
+    lastTrade = null;
+  }
   // Snapshot trades are in ascending time; prepend oldest->newest so newest ends up at top.
   try {
     const ts = Array.isArray(data.trades) ? data.trades : [];
