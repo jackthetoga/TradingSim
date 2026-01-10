@@ -54,6 +54,7 @@ CONFIGS_ALLOWED = {
     "layout": "layout.json",
     "hotkeys": "hotkeys.json",
     "commands": "commands.json",
+    "settings": "settings.json",
 }
 
 
@@ -181,6 +182,7 @@ INDEX_HTML = r"""
 const DISK_LAYOUT = __DISK_LAYOUT__;
 const DISK_HOTKEYS = __DISK_HOTKEYS__;
 const DISK_COMMANDS = __DISK_COMMANDS__;
+const DISK_SETTINGS = __DISK_SETTINGS__;
 
 // ---------------- Windowing (drag/resize/popout) ----------------
 function ensureWorkspaceStyles(){
@@ -575,6 +577,55 @@ let lastTapeTsSeen = null;   // for monotonic tape rendering (prevents "time goi
 let lastTrade = null;        // last trade seen (for initializing live higher-TF candles)
 let sessionStats = { open: null, hi: null, lo: null, pcl: null }; // best-effort quote-like fields
 
+// ---------------- Simulator settings (disk-backed via Configs/settings.json) ----------------
+const SIM_SETTINGS_STORAGE_KEY = 'sim-settings-v1';
+const SIM_SETTINGS_DEFAULTS = { version: 1, allowShorting: false };
+let simSettings = null;
+
+function _normalizeSimSettings(obj){
+  const out = JSON.parse(JSON.stringify(SIM_SETTINGS_DEFAULTS));
+  if (!obj || typeof obj !== 'object') return out;
+  if (Number(obj.version || 0) !== 1) return out;
+  out.allowShorting = !!obj.allowShorting;
+  return out;
+}
+
+function loadSimSettings(){
+  try {
+    if (typeof DISK_SETTINGS !== 'undefined' && DISK_SETTINGS && typeof DISK_SETTINGS === 'object') {
+      return _normalizeSimSettings(DISK_SETTINGS);
+    }
+    const raw = localStorage.getItem(SIM_SETTINGS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return _normalizeSimSettings(parsed);
+  } catch {
+    return JSON.parse(JSON.stringify(SIM_SETTINGS_DEFAULTS));
+  }
+}
+
+function saveSimSettings(){
+  if (!simSettings) return;
+  try { localStorage.setItem(SIM_SETTINGS_STORAGE_KEY, JSON.stringify(simSettings)); } catch {}
+  try { scheduleConfigSave('settings', simSettings); } catch {}
+}
+
+function _allowShorting(){
+  if (!simSettings) simSettings = loadSimSettings();
+  return !!simSettings.allowShorting;
+}
+
+function _wouldGoShort(symbol, side, qty){
+  const sym = String(symbol || '').toUpperCase();
+  const s = String(side || '').toUpperCase();
+  const q = Math.floor(Number(qty));
+  if (!sym || !Number.isFinite(q) || q <= 0) return false;
+  if (s !== 'SELL') return false;
+  const pos = positions?.get?.(sym);
+  const sh = Number(pos?.shares ?? 0);
+  if (!Number.isFinite(sh)) return true;
+  return (sh - q) < 0;
+}
+
 // Perf: coalesce bursty SSE events into a single render per animation frame.
 let _pendingBook = null;
 let _pendingTrades = [];
@@ -615,6 +666,7 @@ function _scheduleReplayFlush(){
         if (lastTapeTsSeen != null && tr.ts_event < lastTapeTsSeen) continue;
         lastTapeTsSeen = tr.ts_event;
         lastTrade = tr;
+        try { maybeTriggerStopsFromTrade(tr); } catch {}
         try { maybeFillFromTrade(tr); } catch {}
         // drive higher-TF charts' in-progress bar close/high/low/volume in real-time
         try {
@@ -1247,13 +1299,16 @@ function tvInit(chart){
 }
 
 function tvResize(chart){
-  if (!chart?.tv || !chart?.wrap) return;
-  const rect = chart.wrap.getBoundingClientRect();
+  // IMPORTANT: size the chart to its actual container, not the whole wrap.
+  // When MACD pane is enabled, the wrap includes both panes; sizing the main chart to the wrap
+  // causes the bottom (volume band) to be clipped because the main container is smaller.
+  if (!chart?.tv || !chart?.container) return;
+  const rect = chart.container.getBoundingClientRect();
   if (!rect || rect.width <= 2 || rect.height <= 2) return;
   chart.tv.applyOptions({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
   // If MACD pane is enabled, resize it too.
-  try { if (chart.macdTv && chart.macdWrap && chart.macdWrap.style.display !== 'none') {
-    const r2 = chart.macdWrap.getBoundingClientRect();
+  try { if (chart.macdTv && chart.macdContainer && chart.macdWrap && chart.macdWrap.style.display !== 'none') {
+    const r2 = chart.macdContainer.getBoundingClientRect();
     chart.macdTv.applyOptions({ width: Math.floor(r2.width), height: Math.floor(r2.height) });
   }} catch {}
 }
@@ -1351,6 +1406,20 @@ function _computeSmaPoints(candles, period){
   return out;
 }
 
+function _computeEmaPoints(candles, period){
+  const out = [];
+  const p = Math.max(2, Math.floor(Number(period || 9)));
+  const closes = candles.map(c=>Number(c.c));
+  const em = _emaSeries(closes, p);
+  for (let i=0;i<candles.length;i++){
+    const time = _tvSecFromNs(candles[i].t);
+    const v = em[i];
+    if (!Number.isFinite(time) || !Number.isFinite(v)) continue;
+    out.push({ time, value: v });
+  }
+  return out;
+}
+
 function _computeVwapPoints(candles, period){
   // VWAP using typical price * volume, either cumulative (period=0) or rolling N bars
   const out = [];
@@ -1402,9 +1471,22 @@ function _computeMacdPoints(candles, fast, slow, signal){
 
 function tvEnsureIndicators(chart){
   if (!chart?.tv) return;
+  const emaOn = !!chart.indEmaEl?.checked;
   const smaOn = !!chart.indSmaEl?.checked;
   const vwapOn = !!chart.indVwapEl?.checked;
   const macdOn = !!chart.indMacdEl?.checked;
+
+  // EMA
+  if (emaOn && !chart.emaSeries) {
+    try {
+      chart.emaSeries = (typeof chart.tv.addLineSeries === 'function')
+        ? chart.tv.addLineSeries({ color: 'rgba(177,108,255,0.95)', lineWidth: 2 })
+        : (typeof chart.tv.addSeries === 'function' && LightweightCharts?.LineSeries)
+          ? chart.tv.addSeries(LightweightCharts.LineSeries, { color: 'rgba(177,108,255,0.95)', lineWidth: 2 })
+          : null;
+    } catch {}
+  }
+  if (!emaOn && chart.emaSeries) { try { chart.tv.removeSeries(chart.emaSeries); } catch {} chart.emaSeries = null; }
 
   // SMA
   if (smaOn && !chart.smaSeries) {
@@ -1505,6 +1587,9 @@ function tvRenderIndicators(chart){
   tvEnsureIndicators(chart);
   const candles = (chart.candles || []).filter(c=>c && Number.isFinite(c.t));
   if (!candles.length) return;
+  if (chart.emaSeries && chart.indEmaEl?.checked) {
+    try { chart.emaSeries.setData(_computeEmaPoints(candles, chart.emaPeriod || 9)); } catch (e) { console.error('EMA setData failed', e); }
+  }
   if (chart.smaSeries && chart.indSmaEl?.checked) {
     try { chart.smaSeries.setData(_computeSmaPoints(candles, chart.smaPeriod || 20)); } catch (e) { console.error('SMA setData failed', e); }
   }
@@ -1785,7 +1870,7 @@ function makeEntryHtml(){
       </div>
 
       <div class="entryHint">
-        UI-only for now (no order routing/fills/P&amp;L yet). Price helpers use current Book/Tape.
+        Local fill sim (MKT/LMT/STOP/STOP-LMT). Price helpers use current Book/Tape.
       </div>
     </div>
   `;
@@ -1853,8 +1938,9 @@ function initEntryWindow(){
 
     if (!symbol) { setErr('Entry: missing symbol'); return; }
     if (!Number.isFinite(shares) || shares <= 0) { setErr('Entry: invalid share size'); return; }
-    if (ordType === 'LMT' && (!Number.isFinite(lmt) || lmt == null)) { setErr('Entry: limit price required'); return; }
-    if (ordType !== 'MKT' && ordType !== 'LMT') { setErr('Entry: only MKT and LMT are implemented'); return; }
+    if ((ordType === 'LMT' || ordType === 'STOPLMT') && (!Number.isFinite(lmt) || lmt == null)) { setErr('Entry: limit price required'); return; }
+    if ((ordType === 'STOP' || ordType === 'STOPLMT') && (!Number.isFinite(stop) || stop == null)) { setErr('Entry: stop trigger required'); return; }
+    if (ordType !== 'MKT' && ordType !== 'LMT' && ordType !== 'STOP' && ordType !== 'STOPLMT') { setErr('Entry: invalid order type'); return; }
 
     setErr('');
     placeOrder({
@@ -1862,7 +1948,8 @@ function initEntryWindow(){
       side,
       type: ordType,
       qty: Math.floor(shares),
-      limitPx: (ordType === 'LMT') ? Number(lmt) : null,
+      limitPx: (ordType === 'LMT' || ordType === 'STOPLMT') ? Number(lmt) : null,
+      stopPx: (ordType === 'STOP' || ordType === 'STOPLMT') ? Number(stop) : null,
       route: route || null,
       display,
     });
@@ -2793,7 +2880,7 @@ function initHotkeysWindow(){
 }
 
 // ---------------- Settings ----------------
-let settingsTab = 'hotkeys'; // hotkeys | layout | about
+let settingsTab = 'hotkeys'; // hotkeys | trading | layout | about
 
 async function saveConfigAs(kind, data, suggestedFilename){
   const def = String(suggestedFilename || `${kind}.json`);
@@ -2815,12 +2902,27 @@ function makeSettingsHtml(){
       <div class="setNav">
         <div class="setNavTitle">Settings</div>
         <button class="setTab" data-tab="hotkeys">Hotkeys</button>
+        <button class="setTab" data-tab="trading">Trading</button>
         <button class="setTab" data-tab="layout">Layout</button>
         <button class="setTab" data-tab="about">About</button>
       </div>
       <div class="setMain">
         <div class="setPane" id="set-pane-hotkeys">
           ${makeHotkeysHtml()}
+        </div>
+        <div class="setPane" id="set-pane-trading" style="display:none;">
+          <div class="setSection">
+            <div style="color:var(--muted); font-size:12px; font-weight:900;">Trading</div>
+            <div style="height:10px;"></div>
+            <label class="hint" style="display:flex; align-items:center; gap:10px;">
+              <input type="checkbox" id="set-allow-shorting"/>
+              Allow shorting (SELL can open a short position)
+            </label>
+            <div style="height:8px;"></div>
+            <div class="setHint">
+              If disabled, any order that would take your position below 0 shares is rejected (including from hotkeys).
+            </div>
+          </div>
         </div>
         <div class="setPane" id="set-pane-layout" style="display:none;">
           <div class="setSection">
@@ -2854,7 +2956,7 @@ function initSettingsWindow(){
       const t = b.getAttribute('data-tab');
       b.classList.toggle('on', t === settingsTab);
     });
-    const panes = ['hotkeys','layout','about'];
+    const panes = ['hotkeys','trading','layout','about'];
     for (const p of panes){
       const el = document.getElementById(`set-pane-${p}`);
       if (el) el.style.display = (p === settingsTab) ? 'block' : 'none';
@@ -2868,6 +2970,31 @@ function initSettingsWindow(){
   });
   setTabTo(settingsTab);
   initHotkeysWindow();
+  try {
+    if (!simSettings) simSettings = loadSimSettings();
+    const cb = document.getElementById('set-allow-shorting');
+    if (cb) cb.checked = !!simSettings.allowShorting;
+    cb?.addEventListener('change', ()=>{
+      if (!simSettings) simSettings = loadSimSettings();
+      simSettings.allowShorting = !!cb.checked;
+      saveSimSettings();
+      if (!simSettings.allowShorting) {
+        // If disabling, cancel any currently-open sell orders that would go net short if filled.
+        let cancelled = 0;
+        for (const o of orders.values()){
+          if (!o) continue;
+          if (o.status !== 'open' && o.status !== 'partial') continue;
+          if (String(o.side).toUpperCase() !== 'SELL') continue;
+          const rem = _orderRemaining(o);
+          if (_wouldGoShort(o.symbol, 'SELL', rem)) { cancelOrder(o.id); cancelled += 1; }
+        }
+        if (cancelled) setStatus(`Shorting disabled; cancelled ${cancelled} open SELL orders that could short`);
+        else setStatus('Shorting disabled');
+      } else {
+        setStatus('Shorting enabled');
+      }
+    });
+  } catch {}
   document.getElementById('layoutSaveAs')?.addEventListener('click', async (e)=>{
     e.preventDefault();
     try {
@@ -3313,6 +3440,7 @@ function makeOpenOrdersHtml(){
               <th>Qty</th>
               <th>Filled</th>
               <th>Rem</th>
+              <th>Stop</th>
               <th>Limit</th>
               <th>Status</th>
               <th></th>
@@ -3354,7 +3482,8 @@ function renderOpenOrders(){
 
   for (const o of list){
     const t = o.ts_intent_ns ? nsToEt(o.ts_intent_ns) : '';
-    const lim = (o.type === 'LMT' && o.limitPx != null && Number.isFinite(Number(o.limitPx))) ? Number(o.limitPx).toFixed(4) : '';
+    const stop = (o.stopPx != null && Number.isFinite(Number(o.stopPx))) ? Number(o.stopPx).toFixed(4) : '';
+    const lim = ((String(o.type).toUpperCase() === 'LMT' || String(o.type).toUpperCase() === 'STOPLMT') && o.limitPx != null && Number.isFinite(Number(o.limitPx))) ? Number(o.limitPx).toFixed(4) : '';
     const rem = _orderRemaining(o);
     rows.push(`
       <tr>
@@ -3366,6 +3495,7 @@ function renderOpenOrders(){
         <td>${String(o.qty)}</td>
         <td>${String(o.filledQty ?? 0)}</td>
         <td>${String(rem)}</td>
+        <td>${stop}</td>
         <td>${lim}</td>
         <td>${String(o.status)}</td>
         <td><button class="wbtn" data-act="cancel" data-oid="${String(o.id)}" style="padding:4px 8px;">Cancel</button></td>
@@ -3493,6 +3623,80 @@ function _recordFill(order, price, fillQty, ts_ns){
   renderOpenOrders();
 }
 
+function maybeTriggerStopsFromTrade(tr){
+  if (!tr) return;
+  const ts = Number(tr.ts_event ?? null);
+  const px = Number(tr.price ?? null);
+  if (!Number.isFinite(ts) || !Number.isFinite(px) || px <= 0) return;
+
+  const candidates = Array.from(orders.values())
+    .filter(o=>{
+      if (!o) return false;
+      const t = String(o.type || '').toUpperCase();
+      if (t !== 'STOP' && t !== 'STOPLMT') return false;
+      if (o.status !== 'open' && o.status !== 'partial') return false;
+      if (o.cancelledAtNs != null) return false;
+      if (!Number.isFinite(Number(o.stopPx))) return false;
+      return true;
+    })
+    .sort((a,b)=> Number(a.ts_intent_ns ?? 0) - Number(b.ts_intent_ns ?? 0));
+
+  for (const o of candidates){
+    const side = String(o.side || '').toUpperCase();
+    const stopPx = Number(o.stopPx);
+    if (!Number.isFinite(stopPx) || stopPx <= 0) continue;
+    const trig = (side === 'BUY') ? (px >= stopPx) : (px <= stopPx);
+    if (!trig) continue;
+
+    // Enforce no-shorting at trigger time too (positions could have changed since placement).
+    if (!_allowShorting() && side === 'SELL') {
+      const rem = _orderRemaining(o);
+      if (_wouldGoShort(o.symbol, 'SELL', rem)) {
+        o.status = 'rejected';
+        orders.set(o.id, o);
+        renderOpenOrders();
+        setStatus(`Rejected ${o.id}: shorting disabled`);
+        continue;
+      }
+    }
+
+    // Promote STOP -> MKT, STOPLMT -> LMT
+    const t = String(o.type || '').toUpperCase();
+    o.triggeredAtNs = ts;
+    if (t === 'STOP') o.type = 'MKT';
+    if (t === 'STOPLMT') o.type = 'LMT';
+    orders.set(o.id, o);
+
+    // Try to fill immediately if it became aggressive/marketable.
+    if (String(o.type).toUpperCase() === 'MKT') {
+      const filled = _sweepAgainstBook(o, ts);
+      if (filled === 0) {
+        const mpx = _bestPxForMarket(side);
+        if (mpx != null) _recordFill(o, mpx, _orderRemaining(o), ts);
+      }
+      continue;
+    }
+    if (String(o.type).toUpperCase() === 'LMT') {
+      const ok = _canFillLimitNow(o);
+      if (ok) _sweepAgainstBook(o, ts);
+      else {
+        // If passive, queueAhead estimate at our limit price (rough).
+        const lim = Number(o.limitPx);
+        const bookSide = (side === 'BUY') ? (currentBook?.bids || []) : (currentBook?.asks || []);
+        let qa = 0;
+        for (const lv of bookSide){
+          const pxx = Number(lv?.[0]);
+          const sz = Math.floor(Number(lv?.[1] ?? 0));
+          if (Number.isFinite(pxx) && Number.isFinite(sz) && sz > 0 && pxx === lim) { qa = sz; break; }
+        }
+        o.queueAhead = qa;
+        orders.set(o.id, o);
+        renderOpenOrders();
+      }
+    }
+  }
+}
+
 function _sweepAgainstBook(order, ts_ns){
   if (!order || (order.status !== 'open' && order.status !== 'partial')) return 0;
   if (order.cancelledAtNs != null) return 0;
@@ -3591,18 +3795,24 @@ function maybeFillFromTrade(tr){
   }
 }
 
-function placeOrder({symbol, side, type, qty, limitPx, route, tif, display}){
+function placeOrder({symbol, side, type, qty, limitPx, stopPx, route, tif, display}){
   const sym = String(symbol || '').trim().toUpperCase();
   const s = String(side || 'BUY').toUpperCase();
   const t = String(type || 'MKT').toUpperCase();
   const q = Math.floor(Number(qty));
   const lim = (limitPx == null) ? null : Number(limitPx);
+  const stp = (stopPx == null) ? null : Number(stopPx);
   const ts_ns = (playheadNs ?? loadedStartNs ?? null);
   if (!sym) { setErr('Order: missing symbol'); return null; }
   if (s !== 'BUY' && s !== 'SELL') { setErr('Order: invalid side'); return null; }
-  if (t !== 'MKT' && t !== 'LMT') { setErr('Order: only MKT/LMT supported'); return null; }
+  if (t !== 'MKT' && t !== 'LMT' && t !== 'STOP' && t !== 'STOPLMT') { setErr('Order: invalid type'); return null; }
   if (!Number.isFinite(q) || q <= 0) { setErr('Order: invalid qty'); return null; }
-  if (t === 'LMT' && (!Number.isFinite(lim) || lim == null || lim <= 0)) { setErr('Order: invalid limit price'); return null; }
+  if ((t === 'LMT' || t === 'STOPLMT') && (!Number.isFinite(lim) || lim == null || lim <= 0)) { setErr('Order: invalid limit price'); return null; }
+  if ((t === 'STOP' || t === 'STOPLMT') && (!Number.isFinite(stp) || stp == null || stp <= 0)) { setErr('Order: invalid stop price'); return null; }
+
+  if (!_allowShorting() && s === 'SELL') {
+    if (_wouldGoShort(sym, 'SELL', q)) { setErr('Order: shorting disabled'); return null; }
+  }
 
   const id = `O${++_orderSeq}`;
   const order = {
@@ -3612,7 +3822,9 @@ function placeOrder({symbol, side, type, qty, limitPx, route, tif, display}){
     side: s,
     type: t,
     qty: q,
-    limitPx: (t === 'LMT') ? lim : null,
+    stopPx: (t === 'STOP' || t === 'STOPLMT') ? stp : null,
+    triggeredAtNs: null,
+    limitPx: (t === 'LMT' || t === 'STOPLMT') ? lim : null,
     route,
     tif,
     display,
@@ -3623,6 +3835,11 @@ function placeOrder({symbol, side, type, qty, limitPx, route, tif, display}){
   };
   orders.set(id, order);
   renderOpenOrders();
+
+  if (t === 'STOP' || t === 'STOPLMT') {
+    setStatus(`Accepted ${s} ${q} ${sym} ${t} (stop ${Number(stp).toFixed(4)}${t==='STOPLMT' ? `, limit ${Number(lim).toFixed(4)}` : ''})`);
+    return id;
+  }
 
   if (t === 'MKT') {
     // fill as much as available from book now; remainder stays open and will continue to fill on subsequent book updates
@@ -3724,10 +3941,6 @@ function makeChartHtml(chartId){
         <button class="wbtn tfBtn" data-tf="10s" style="padding:4px 8px;">10s</button>
         <button class="wbtn tfBtn" data-tf="1m" style="padding:4px 8px;">1m</button>
         <button class="wbtn tfBtn" data-tf="5m" style="padding:4px 8px;">5m</button>
-        <div style="width:1px; height:18px; background: rgba(34,48,69,0.9); margin:0 2px;"></div>
-        <label class="hint" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" class="indSma" checked/> SMA</label>
-        <label class="hint" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" class="indVwap"/> VWAP</label>
-        <label class="hint" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" class="indMacd"/> MACD</label>
         <button class="wbtn indGear" title="Indicator settings" style="padding:4px 8px;">⚙</button>
       </div>
       <div class="indPanel" style="display:none; position:absolute; left:10px; top:52px; z-index:6; width:260px; padding:10px; border:1px solid var(--grid); border-radius:10px; background: rgba(15,23,35,0.95);">
@@ -3736,6 +3949,17 @@ function makeChartHtml(chartId){
           <button class="wbtn indClose" style="padding:4px 8px;">Close</button>
         </div>
         <div style="height:10px;"></div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <label class="hint" style="display:flex; align-items:center; gap:8px;"><input type="checkbox" class="indEma" checked/> EMA</label>
+          <label class="hint" style="display:flex; align-items:center; gap:8px;"><input type="checkbox" class="indSma"/> SMA</label>
+          <label class="hint" style="display:flex; align-items:center; gap:8px;"><input type="checkbox" class="indVwap"/> VWAP</label>
+          <label class="hint" style="display:flex; align-items:center; gap:8px;"><input type="checkbox" class="indMacd"/> MACD</label>
+        </div>
+        <div style="height:14px;"></div>
+        <div style="color:var(--muted); font-size:12px; font-weight:700;">EMA</div>
+        <div style="height:6px;"></div>
+        <label class="hint">Length <input class="emaPeriod" type="number" min="2" step="1" value="9" style="width:90px;"/></label>
+        <div style="height:12px;"></div>
         <div style="color:var(--muted); font-size:12px; font-weight:700;">SMA</div>
         <div style="height:6px;"></div>
         <label class="hint">Period <input class="smaPeriod" type="number" min="2" step="1" value="20" style="width:90px;"/></label>
@@ -3799,11 +4023,13 @@ function createChartWindow(tf){
     candleSeries: null,
     volSeries: null,
     // indicator UI + settings
+    indEmaEl: win.querySelector('.indEma'),
     indSmaEl: win.querySelector('.indSma'),
     indVwapEl: win.querySelector('.indVwap'),
     indMacdEl: win.querySelector('.indMacd'),
     indGearEl: win.querySelector('.indGear'),
     indPanelEl: win.querySelector('.indPanel'),
+    emaPeriodEl: win.querySelector('.emaPeriod'),
     smaPeriodEl: win.querySelector('.smaPeriod'),
     vwapPeriodEl: win.querySelector('.vwapPeriod'),
     macdFastEl: win.querySelector('.macdFast'),
@@ -3811,11 +4037,13 @@ function createChartWindow(tf){
     macdSignalEl: win.querySelector('.macdSignal'),
     indCloseEl: win.querySelector('.indClose'),
     indApplyEl: win.querySelector('.indApply'),
+    emaPeriod: 9,
     smaPeriod: 20,
     vwapPeriod: 0,
     macdFast: 12,
     macdSlow: 26,
     macdSignal: 9,
+    emaSeries: null,
     smaSeries: null,
     vwapSeries: null,
     macdTv: null,
@@ -3879,6 +4107,7 @@ function createChartWindow(tf){
   const closePanel = ()=>{ chart.indPanelEl.style.display = 'none'; };
   chart.indGearEl?.addEventListener('click', ()=>{
     // sync UI to current values
+    chart.emaPeriodEl.value = String(chart.emaPeriod);
     chart.smaPeriodEl.value = String(chart.smaPeriod);
     chart.vwapPeriodEl.value = String(chart.vwapPeriod);
     chart.macdFastEl.value = String(chart.macdFast);
@@ -3888,11 +4117,13 @@ function createChartWindow(tf){
   });
   chart.indCloseEl?.addEventListener('click', closePanel);
   chart.indApplyEl?.addEventListener('click', ()=>{
+    const emaP = parseInt(chart.emaPeriodEl.value || '9', 10);
     const smaP = parseInt(chart.smaPeriodEl.value || '20', 10);
     const vwapP = parseInt(chart.vwapPeriodEl.value || '0', 10);
     const mf = parseInt(chart.macdFastEl.value || '12', 10);
     const ms = parseInt(chart.macdSlowEl.value || '26', 10);
     const msi = parseInt(chart.macdSignalEl.value || '9', 10);
+    chart.emaPeriod = Math.max(2, Number.isFinite(emaP) ? emaP : 9);
     chart.smaPeriod = Math.max(2, Number.isFinite(smaP) ? smaP : 20);
     chart.vwapPeriod = Math.max(0, Number.isFinite(vwapP) ? vwapP : 0);
     chart.macdFast = Math.max(2, Number.isFinite(mf) ? mf : 12);
@@ -3906,6 +4137,7 @@ function createChartWindow(tf){
     chart._indDirty = true;
     drawChart(chart);
   };
+  chart.indEmaEl?.addEventListener('change', indToggle);
   chart.indSmaEl?.addEventListener('change', indToggle);
   chart.indVwapEl?.addEventListener('change', indToggle);
   chart.indMacdEl?.addEventListener('change', indToggle);
@@ -5135,10 +5367,12 @@ def index():
     layout = _read_cfg("layout")
     hotkeys = _read_cfg("hotkeys")
     commands = _read_cfg("commands")
+    settings = _read_cfg("settings")
     html = INDEX_HTML
     html = html.replace("__DISK_LAYOUT__", json.dumps(layout) if layout is not None else "null")
     html = html.replace("__DISK_HOTKEYS__", json.dumps(hotkeys) if hotkeys is not None else "null")
     html = html.replace("__DISK_COMMANDS__", json.dumps(commands) if commands is not None else "null")
+    html = html.replace("__DISK_SETTINGS__", json.dumps(settings) if settings is not None else "null")
     return HTMLResponse(html)
 
 
