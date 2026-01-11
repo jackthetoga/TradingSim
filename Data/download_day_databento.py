@@ -122,6 +122,57 @@ def _merge_parquets_concat(
     return out_path
 
 
+def _merge_parquets_concat_columns(
+    parquet_paths: Sequence[Path],
+    out_path: Path,
+    *,
+    columns: Sequence[str],
+    batch_size: int = 250_000,
+) -> Path:
+    """
+    Concatenate multiple parquet files into one parquet file, streaming batches, keeping only `columns`.
+
+    This is safer than `_merge_parquets_concat` when inputs may come from different datasets that
+    include extra columns or differ slightly in schema details. The simulator only needs a subset
+    of MBP-10 columns; we write a stable merged schema for those columns.
+    """
+    parquet_paths = [p for p in parquet_paths if p.exists()]
+    if not parquet_paths:
+        raise FileNotFoundError("No parquet inputs provided to merge.")
+
+    first_pf = pq.ParquetFile(parquet_paths[0])
+    schema0 = first_pf.schema_arrow
+    missing0 = [c for c in columns if c not in schema0.names]
+    if missing0:
+        raise ValueError(
+            f"Base parquet {parquet_paths[0].name} is missing required columns {missing0}. "
+            f"Columns present: {schema0.names}"
+        )
+    out_schema = pa.schema([schema0.field(c) for c in columns])
+
+    tmp_out = out_path.with_suffix(out_path.suffix + ".tmp")
+    if tmp_out.exists():
+        tmp_out.unlink()
+
+    with pq.ParquetWriter(tmp_out, schema=out_schema) as writer:
+        for p in parquet_paths:
+            pf = pq.ParquetFile(p)
+            missing = [c for c in columns if c not in pf.schema_arrow.names]
+            if missing:
+                raise ValueError(
+                    f"Parquet {p.name} is missing required columns {missing}. "
+                    f"Columns present: {pf.schema_arrow.names}"
+                )
+            for batch in pf.iter_batches(columns=list(columns), batch_size=batch_size):
+                tbl = pa.Table.from_batches([batch])
+                if tbl.schema != out_schema:
+                    tbl = tbl.cast(out_schema, safe=False)
+                writer.write_table(tbl)
+
+    tmp_out.replace(out_path)
+    return out_path
+
+
 def fetch_to_parquet_incremental(
     client: db.Historical,
     *,
@@ -400,6 +451,93 @@ def fetch_with_dataset_fallback(
     )
 
 
+def fetch_mbp10_multi_venue_combined(
+    client: db.Historical,
+    *,
+    symbols: Sequence[str],
+    start: datetime,
+    end: datetime,
+    out_dir: Path,
+    day: str,
+    overwrite: bool = False,
+    datasets: Sequence[str] = ("XNAS.ITCH", "EDGX.PITCH", "BATS.PITCH"),
+) -> Path:
+    """
+    Download MBP-10 from multiple venues and combine into a single simulator-compatible file.
+
+    The simulator expects the filename pattern `XNAS.ITCH.<DAY>.mbp-10.parquet` regardless of
+    where the depth was sourced from. We therefore download each venue into temporary parquet
+    files, then concatenate into the compatibility filename.
+    """
+    out_dir = Path(out_dir)
+    _ensure_dir(out_dir)
+
+    combined = out_dir / f"XNAS.ITCH.{day}.mbp-10.parquet"
+
+    # Simulator only reads these columns for MBP-10:
+    mbp_cols = (
+        ["ts_event", "symbol"]
+        + [f"bid_px_{i:02d}" for i in range(10)]
+        + [f"bid_sz_{i:02d}" for i in range(10)]
+        + [f"ask_px_{i:02d}" for i in range(10)]
+        + [f"ask_sz_{i:02d}" for i in range(10)]
+    )
+
+    desired = list(dict.fromkeys(symbols))  # stable unique
+    if not desired:
+        raise ValueError("No symbols provided.")
+
+    # Fresh build: download all requested symbols from each venue, then merge into the combined file.
+    if overwrite or not combined.exists():
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            per_venue_tmp: list[Path] = []
+            for ds in datasets:
+                p = td_path / f"{ds}.{day}.mbp-10.parquet"
+                fetch_to_parquet(
+                    client,
+                    dataset=ds,
+                    schema="mbp-10",
+                    symbols=desired,
+                    start=start,
+                    end=end,
+                    out_path=p,
+                )
+                per_venue_tmp.append(p)
+            _merge_parquets_concat_columns(per_venue_tmp, combined, columns=mbp_cols)
+        return combined
+
+    # Incremental build: only download missing symbols, merge them, then merge with the existing combined file.
+    existing = _existing_symbols_in_parquet(combined)
+    missing = [s for s in desired if s not in existing]
+    if not missing:
+        print(f"Already present (mbp-10 combined) in {combined.name}: {sorted(existing)}")
+        return combined
+
+    print(f"Incremental download (mbp-10 combined): missing symbols {missing} -> {combined.name}")
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        per_venue_tmp: list[Path] = []
+        for ds in datasets:
+            p = td_path / f"{ds}.{day}.mbp-10.parquet"
+            fetch_to_parquet(
+                client,
+                dataset=ds,
+                schema="mbp-10",
+                symbols=missing,
+                start=start,
+                end=end,
+                out_path=p,
+            )
+            per_venue_tmp.append(p)
+
+        merged_missing = td_path / f"XNAS.ITCH.{day}.mbp-10.missing.parquet"
+        _merge_parquets_concat_columns(per_venue_tmp, merged_missing, columns=mbp_cols)
+        _merge_parquets_concat_columns([combined, merged_missing], combined, columns=mbp_cols)
+
+    return combined
+
+
 def build_bars_from_ohlcv_1s(
     ohlcv_1s_parquet: Path,
     out_path: Path,
@@ -572,24 +710,28 @@ def download_day(
     bars1m_path = out / f"EQUS.MINI.{day}.ohlcv-1m.parquet"
     bars5m_path = out / f"EQUS.MINI.{day}.ohlcv-5m.parquet"
     if download_trades:
-        fetch_trades_with_dataset_fallback(
+        # Per user requirement: trades from XNAS.BASIC only (no fallback).
+        fetch_to_parquet_incremental(
             client,
+            dataset="XNAS.BASIC",
+            schema="trades",
             symbols=symbols,
             start=start,
             end=end,
-            out_path=trades_path,  # keep filename EQUS.MINI.<DAY>.trades.parquet regardless of dataset used
+            out_path=trades_path,  # keep filename EQUS.MINI.<DAY>.trades.parquet for simulator compatibility
             overwrite=overwrite,
         )
     if download_ohlcv1s:
-        fetch_with_dataset_fallback(
+        # Per user requirement: 1s OHLCV from BATS.PITCH only (no fallback).
+        fetch_to_parquet_incremental(
             client,
+            dataset="BATS.PITCH",
             schema="ohlcv-1s",
             symbols=symbols,
             start=start,
             end=end,
-            out_path=ohlcv1s_path,  # keep filename EQUS.MINI.<DAY>.ohlcv-1s.parquet regardless of dataset used
+            out_path=ohlcv1s_path,  # keep filename EQUS.MINI.<DAY>.ohlcv-1s.parquet for simulator compatibility
             overwrite=overwrite,
-            dataset_priority=("XNAS.BASIC", "XNYS.PILLAR", "EDGX.PITCH", "EDGA.PITCH", "EQUS.MINI"),
         )
         # Build derived bars (local resampling, no extra API usage).
         # We only build bars for symbols that are missing in each derived file, then merge locally.
@@ -623,16 +765,17 @@ def download_day(
                 build_5m_bars_from_ohlcv_1s(ohlcv1s_path, tmp, tz=window.tz, symbols=missing_5m)
                 _merge_parquets_concat([bars5m_path, tmp], bars5m_path)
     if download_mbp10:
-        # Keep original behavior: MBP-10 always comes from the Nasdaq ITCH book.
-        fetch_to_parquet_incremental(
+        # Per user requirement: download multiple venues and combine into a single
+        # `XNAS.ITCH.<DAY>.mbp-10.parquet` file for simulator compatibility.
+        mbp10_path = fetch_mbp10_multi_venue_combined(
             client,
-            dataset="XNAS.ITCH",
-            schema="mbp-10",
             symbols=symbols,
             start=start,
             end=end,
-            out_path=mbp10_path,
+            out_dir=out,
+            day=day,
             overwrite=overwrite,
+            datasets=("XNAS.ITCH", "EDGX.PITCH", "BATS.PITCH"),
         )
 
     print("Wrote:")
