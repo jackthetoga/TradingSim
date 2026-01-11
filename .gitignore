@@ -12,3 +12,9 @@ venv/
 
 # Data scratch
 *.log
+
+# Databento outputs (generated data files)
+databento_out/
+databento_out2/
+databento_out copy/
+databento_test/

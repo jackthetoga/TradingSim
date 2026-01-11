@@ -10,6 +10,8 @@ The simulator’s purpose is training: **repeatable, high-fidelity practice** us
 
 - **Regression tests are off-limits**: the agent **CANNOT modify the regression test(s) to make them pass under any circumstances**. Fix production code instead.
 
+- Use Conda environment TradingProject
+
 ---
 
 ### Business intent (what we’re building)
@@ -33,7 +35,9 @@ This project is currently a **local web app served by Python (FastAPI)**, readin
 - **Backend**: Python + FastAPI
   - Serves the HTML/JS UI
   - Exposes replay APIs (snapshot + streaming) over HTTP (SSE) in `Simulator.py`
-  - Persists UI configs to disk under `Configs/` via `POST /api/config/save` (currently: `layout.json`, `hotkeys.json`)
+  - Persists UI configs to disk under `Configs/` via `POST /api/config/save` (currently: `layout.json`, `hotkeys.json`, `commands.json`)
+  - Supports Settings “Save As…” flows via `POST /api/config/save_as`
+  - Validates DAS-like command scripts via `POST /api/commands/validate` (parser/validator in `Simulator/Commands.py`)
 - **Frontend**: Plain HTML + CSS + vanilla JS (embedded in the Python files)
   - LVL2 ladder (top 10)
   - Time & Sales tape
@@ -134,6 +138,12 @@ This structure is designed for **fast sequential playback** and “at-or-before�
 - **`GET /api/config/load`**
   - Loads a named config from `Configs/` (if present)
 
+ - **`POST /api/config/save_as`**
+  - Saves a config payload to a user-chosen filename under `Configs/` (used by Settings “Save As…” buttons)
+
+- **`POST /api/commands/validate`**
+  - Validates a DAS-like script string for syntax + allowed identifiers/commands (used by the Commands editor)
+
 Important realism detail already handled:
 - For higher timeframes (`10s/1m/5m`), the UI avoids “future leaking” by **building the in-progress candle from tape trades** rather than trusting precomputed OHLCV for the current bucket.
 
@@ -153,10 +163,12 @@ The replay UI is served at `http://127.0.0.1:8000` when `Simulator/Simulator.py`
     - **Open Orders**: live view of working orders with cancel / cancel-all
     - **Trading History**: fills log with realized P/L per fill (when applicable)
     - **Positions**: shares, avg cost, open/total P&L (marks off last trade / book)
-    - **Hotkeys**: view/edit/record keybinds by context
+    - **Commands**: DAS-like scripting editor (create/check/run commands; bindable via hotkeys as `das:<id>`)
+    - **Settings**: Settings hub window with tabs (includes a Hotkeys tab)
   - Window tools:
     - **Windows** picker (spawn/show windows in-page; charts can be spawned repeatedly)
     - **Add Chart** (spawn another chart window)
+    - **Settings** (quick access button to show the Settings window)
   - Windowing:
     - draggable/resizable windows
     - popout support (open a panel in a separate tab) with cross-tab control sync
@@ -186,12 +198,44 @@ Trading state is updated **event-by-event** as replay data arrives (book updates
 
 - **Hotkeys**
   - Contexts: `global`, `entry`, `chart`, `tape`, `l2` (active context follows the focused window)
-  - Editable in the **Hotkeys** window with a “record” flow; persisted to localStorage and to `Configs/hotkeys.json`.
+  - Editable with a “record” flow (currently surfaced in the **Settings → Hotkeys** tab); persisted to localStorage and to `Configs/hotkeys.json`.
+  - The hotkey system supports binding:
+    - built-in commands (e.g. `trade.buy`, `risk.flatten_all`)
+    - DAS scripts (`das:<id>`, authored in the Commands window)
+    - custom commands (`custom:<name>`, see below)
 
 - **Layout saving**
   - Window positions/sizes/z-order/hidden state and chart window layout are captured and persisted to localStorage and to `Configs/layout.json`.
   - On startup, layout/hotkeys are injected from disk configs when present for consistent defaults across sessions.
 
+---
+
+### Custom commands + DAS scripting (current)
+
+The simulator has two “programmability” layers:
+
+- **DAS-like scripts** (user-authored)
+  - Authored in the **Commands** window; each saved command has an `id`, `name`, and `script`.
+  - Hotkeys bind to these using `das:<id>`.
+  - Backend validates scripts via `POST /api/commands/validate` using `Simulator/Commands.py`.
+  - Commands are persisted to localStorage and to `Configs/commands.json`.
+
+- **Custom commands** (`custom:<name>`) (hotkey-level macros)
+  - Stored alongside hotkey bindings in the hotkeys config.
+  - Each custom command can be:
+    - an **alias** to a single command id, or
+    - a **steps** array: sequential `{cmd, args}` invocations
+  - Custom commands can call other `custom:` commands, with loop protection.
+
+---
+
+### Settings window (current)
+
+The **Settings** window is the central place to manage simulator configuration via tabs:
+
+- **Hotkeys tab**: full hotkeys UI (contexts, recording, warnings) plus “Save As…” to write a custom hotkeys JSON under `Configs/`.
+- **Layout tab**: “Save As…” to write the current layout JSON under `Configs/` (layout also auto-saves to `Configs/layout.json`).
+- **About tab**: placeholder/info.
 ---
 
 ### How to run (local)
@@ -232,3 +276,15 @@ Implementation notes:
 - **Replay tooling**: session presets, bookmarks, repeat scenarios, stats
 - **Trader workflows**: DAS-like montage, hotkeys, layouts, symbol hot swap
 - **Journal & review**: trades log, screenshots, metrics, play-by-play review
+
+
+
+Download new data:
+conda activate TradingProject
+DATABENTO_API_KEY='db-8s3HfiJfeMWcuf4QHPWkmmEvspMNW' python3 /Users/zizizink/Documents/TradingProject/Data/download_day_databento.py \
+  --day <> \
+  --symbols <>\
+  --tz America/New_York \
+  --start-time 07:00:00 \
+  --end-time 10:30:00 \
+  --out-dir /Users/zizizink/Documents/TradingProject/databento_out

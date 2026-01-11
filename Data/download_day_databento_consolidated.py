@@ -1,20 +1,34 @@
-# download_day_databento.py
-# pip install databento pandas pyarrow
+# download_day_databento_consolidated.py
+#
+# This is a copy of `Data/download_day_databento.py`, but it targets Databento's
+# consolidated US equities dataset for Trades + OHLCV-1s.
+#
+# Notes:
+# - Databento entitlements vary by account. Some datasets may be "valid" but have no data for you
+#   (e.g. reporting an available end around 1970). To avoid guesswork, this script supports
+#   AUTO dataset selection: it will probe a short trades query and pick the first dataset that works.
+# - The default is AUTO with a sensible candidate list. You can override via --eq-dataset.
+# - We still optionally download Nasdaq L2 via XNAS.ITCH (mbp-10), since that is a separate feed.
+#
+# Usage example:
+#   conda activate TradingProject
+#   DATABENTO_API_KEY=... python /Users/zizizink/Documents/TradingProject/Data/download_day_databento_consolidated.py \
+#     --day 2026-01-06 --symbols ALMS \
+#     --tz America/New_York --start-time 07:00:00 --end-time 10:30:00 \
+#     --out-dir /Users/zizizink/Documents/TradingProject/databento_out
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
+import os
 from pathlib import Path
-import shutil
 import tempfile
 from typing import Sequence
-
-import databento as db
-import os
 from zoneinfo import ZoneInfo
 
+import databento as db
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -211,192 +225,104 @@ def fetch_to_parquet(
     return out_path
 
 
-def _parquet_has_rows(parquet_path: Path) -> bool:
-    if not parquet_path.exists():
-        return False
-    pf = pq.ParquetFile(parquet_path)
-    md = pf.metadata
-    if md is None:
-        return False
-    return md.num_rows > 0
+def _parse_dataset_list(eq_dataset: str) -> list[str]:
+    """
+    Accept either:
+      - "AUTO" (case-insensitive)
+      - a single dataset code like "EQUS.PLUS"
+      - a comma-separated list like "EQUS.PLUS,XNAS.NLS,XCIS.TRADESBBO"
+    """
+    s = str(eq_dataset or "").strip()
+    if not s:
+        return ["AUTO"]
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return parts or ["AUTO"]
 
 
-def fetch_trades_with_dataset_fallback(
+def _probe_trades_dataset(
     client: db.Historical,
     *,
+    dataset: str,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[bool, str]:
+    """
+    Return (ok, reason). Uses a tiny trades query to see if the dataset is actually usable.
+    """
+    try:
+        store = client.timeseries.get_range(
+            dataset=dataset,
+            schema="trades",
+            stype_in="raw_symbol",
+            symbols=[symbol],
+            start=start,
+            end=end,
+        )
+        # If Databento returns a Store with 0 records, it's still a "working" dataset, but not useful.
+        try:
+            n = int(getattr(store, "n", 0) or 0)
+        except Exception:
+            n = 0
+        if n <= 0:
+            return False, "query returned 0 records"
+        return True, f"ok (n={n})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _choose_eq_dataset(
+    client: db.Historical,
+    *,
+    eq_dataset: str,
     symbols: Sequence[str],
     start: datetime,
     end: datetime,
-    out_path: Path,
-    overwrite: bool = False,
-    dataset_priority: Sequence[str] = ("XNAS.BASIC", "XNYS.PILLAR", "EDGX.PITCH", "EDGA.PITCH", "EQUS.MINI"),
-) -> Path:
+) -> str:
     """
-    Trades-only downloader: try multiple datasets in priority order, but always write to `out_path`.
+    Choose an equities dataset for trades/ohlcv-1s downloads.
 
-    This is used by `download_day_databento_not_EQUS.py` to prefer venue-specific feeds for trades
-    when available, falling back to EQUS.MINI as a last resort.
+    If eq_dataset is AUTO, try a short list of candidates commonly used for consolidated-ish tape:
+      - EQUS.PLUS (broader composite feed than EQUS.MINI on many accounts)
+      - XNAS.NLS (Nasdaq Last Sale; strong for Nasdaq-listed symbols)
+      - XCIS.TRADESBBO / XCIS.TRADES (consolidated-like trades feeds when entitled)
+      - EQUS.MINI (fallback; you already use this)
     """
-    desired = list(dict.fromkeys(symbols))  # stable unique
-    if not desired:
-        raise ValueError("No symbols provided.")
+    want = _parse_dataset_list(eq_dataset)
+    if want and want[0].upper() != "AUTO":
+        return want[0]
 
-    if overwrite or not out_path.exists():
-        with tempfile.TemporaryDirectory() as td:
-            td_path = Path(td)
-            tmp = td_path / f"{out_path.stem}.candidate{out_path.suffix}"
-            errors: list[tuple[str, str]] = []
-            for dataset in dataset_priority:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                    fetch_to_parquet(
-                        client,
-                        dataset=dataset,
-                        schema="trades",
-                        symbols=desired,
-                        start=start,
-                        end=end,
-                        out_path=tmp,
-                    )
-                    if _parquet_has_rows(tmp):
-                        tmp.replace(out_path)
-                        print(f"Trades dataset selected: {dataset} -> {out_path.name}")
-                        return out_path
-                    errors.append((dataset, "download succeeded but returned 0 rows"))
-                except Exception as e:  # noqa: BLE001 - best-effort fallback across datasets
-                    errors.append((dataset, f"{type(e).__name__}: {e}"))
+    # Candidate order: broad composite first, then venue-specific last-sale, then consolidated variants, then mini fallback.
+    candidates = [
+        "EQUS.PLUS",
+        "EQUS.ALL",
+        "XNAS.NLS",
+        "XCIS.TRADESBBO",
+        "XCIS.TRADES",
+        "XNYS.TRADESBBO",
+        "XNYS.TRADES",
+        "EQUS.MINI",
+    ]
+    sym0 = str(list(symbols)[0])
 
-        raise RuntimeError(
-            "Failed to download trades from any dataset. Attempts:\n"
-            + "\n".join([f"- {ds}: {msg}" for ds, msg in errors])
-        )
+    # Use a small probe window (first 2 minutes of requested window) to avoid large charges.
+    probe_end = start
+    try:
+        # Add 2 minutes to start without importing timedelta (keep deps minimal).
+        probe_end = datetime.fromtimestamp(start.timestamp() + 120, tz=ZoneInfo("UTC"))
+    except Exception:
+        probe_end = end
 
-    # Incremental path: keep existing out_path, only fetch missing symbols, then merge.
-    existing = _existing_symbols_in_parquet(out_path)
-    missing = [s for s in desired if s not in existing]
-    if not missing:
-        print(f"Already present (trades) in {out_path.name}: {sorted(existing)}")
-        return out_path
-
-    print(f"Incremental download (trades): missing symbols {missing} -> {out_path.name}")
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        tmp_new = td_path / f"{out_path.stem}.new{out_path.suffix}"
-        errors: list[tuple[str, str]] = []
-        for dataset in dataset_priority:
-            try:
-                if tmp_new.exists():
-                    tmp_new.unlink()
-                fetch_to_parquet(
-                    client,
-                    dataset=dataset,
-                    schema="trades",
-                    symbols=missing,
-                    start=start,
-                    end=end,
-                    out_path=tmp_new,
-                )
-                if _parquet_has_rows(tmp_new):
-                    _merge_parquets_concat([out_path, tmp_new], out_path)
-                    print(f"Trades dataset selected (incremental): {dataset} -> {out_path.name}")
-                    return out_path
-                errors.append((dataset, "download succeeded but returned 0 rows"))
-            except Exception as e:  # noqa: BLE001 - best-effort fallback across datasets
-                errors.append((dataset, f"{type(e).__name__}: {e}"))
+    for ds in candidates:
+        ok, reason = _probe_trades_dataset(client, dataset=ds, symbol=sym0, start=start, end=probe_end)
+        print(f"[AUTO] Probe {ds}: {reason}")
+        if ok:
+            return ds
 
     raise RuntimeError(
-        "Failed to incrementally download trades from any dataset. Attempts:\n"
-        + "\n".join([f"- {ds}: {msg}" for ds, msg in errors])
-    )
-
-
-def fetch_with_dataset_fallback(
-    client: db.Historical,
-    *,
-    schema: str,
-    symbols: Sequence[str],
-    start: datetime,
-    end: datetime,
-    out_path: Path,
-    overwrite: bool = False,
-    dataset_priority: Sequence[str],
-) -> Path:
-    """
-    Generic downloader: try multiple datasets in priority order for the same schema, but always
-    write to `out_path` (so naming conventions stay stable even when the selected dataset changes).
-    """
-    desired = list(dict.fromkeys(symbols))  # stable unique
-    if not desired:
-        raise ValueError("No symbols provided.")
-
-    if overwrite or not out_path.exists():
-        with tempfile.TemporaryDirectory() as td:
-            td_path = Path(td)
-            tmp = td_path / f"{out_path.stem}.candidate{out_path.suffix}"
-            errors: list[tuple[str, str]] = []
-            for dataset in dataset_priority:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                    fetch_to_parquet(
-                        client,
-                        dataset=dataset,
-                        schema=schema,
-                        symbols=desired,
-                        start=start,
-                        end=end,
-                        out_path=tmp,
-                    )
-                    if _parquet_has_rows(tmp):
-                        tmp.replace(out_path)
-                        print(f"{schema} dataset selected: {dataset} -> {out_path.name}")
-                        return out_path
-                    errors.append((dataset, "download succeeded but returned 0 rows"))
-                except Exception as e:  # noqa: BLE001 - best-effort fallback across datasets
-                    errors.append((dataset, f"{type(e).__name__}: {e}"))
-
-        raise RuntimeError(
-            f"Failed to download {schema} from any dataset. Attempts:\n"
-            + "\n".join([f"- {ds}: {msg}" for ds, msg in errors])
-        )
-
-    # Incremental path: keep existing out_path, only fetch missing symbols, then merge.
-    existing = _existing_symbols_in_parquet(out_path)
-    missing = [s for s in desired if s not in existing]
-    if not missing:
-        print(f"Already present ({schema}) in {out_path.name}: {sorted(existing)}")
-        return out_path
-
-    print(f"Incremental download ({schema}): missing symbols {missing} -> {out_path.name}")
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        tmp_new = td_path / f"{out_path.stem}.new{out_path.suffix}"
-        errors: list[tuple[str, str]] = []
-        for dataset in dataset_priority:
-            try:
-                if tmp_new.exists():
-                    tmp_new.unlink()
-                fetch_to_parquet(
-                    client,
-                    dataset=dataset,
-                    schema=schema,
-                    symbols=missing,
-                    start=start,
-                    end=end,
-                    out_path=tmp_new,
-                )
-                if _parquet_has_rows(tmp_new):
-                    _merge_parquets_concat([out_path, tmp_new], out_path)
-                    print(f"{schema} dataset selected (incremental): {dataset} -> {out_path.name}")
-                    return out_path
-                errors.append((dataset, "download succeeded but returned 0 rows"))
-            except Exception as e:  # noqa: BLE001 - best-effort fallback across datasets
-                errors.append((dataset, f"{type(e).__name__}: {e}"))
-
-    raise RuntimeError(
-        f"Failed to incrementally download {schema} from any dataset. Attempts:\n"
-        + "\n".join([f"- {ds}: {msg}" for ds, msg in errors])
+        "AUTO dataset selection failed: none of the candidate datasets returned trades for "
+        f"symbol={sym0!r} in the requested window. "
+        "Try setting --eq-dataset explicitly from the dataset list Databento returned."
     )
 
 
@@ -431,7 +357,6 @@ def build_bars_from_ohlcv_1s(
         raise ValueError(f"Unsupported freq={freq!r}. Supported: {sorted(freq_map)}")
     bucket_sec = freq_map[freq]
     bucket_ns = bucket_sec * 1_000_000_000
-    end_offset_ns = (bucket_sec - 1) * 1_000_000_000
 
     cols = ["symbol", "ts_event", "open", "high", "low", "close", "volume"]
     table = pq.read_table(ohlcv_1s_parquet, columns=cols)
@@ -463,14 +388,12 @@ def build_bars_from_ohlcv_1s(
     # Create bucket start as epoch ns integer
     ts_ns = pc.cast(table["ts_event"], pa.int64())
     table = table.append_column("_ts_ns", ts_ns)
-    # NOTE: pyarrow.compute does not expose floor_divide in some versions (e.g. pyarrow 21).
-    # For non-negative int64 timestamps, integer division is equivalent to floor division.
+    # NOTE: for non-negative int64 timestamps, integer division is equivalent to floor division.
     bucket_ns_s = pa.scalar(bucket_ns, pa.int64())
     bucket_start_ns = pc.multiply(pc.divide(ts_ns, bucket_ns_s), bucket_ns_s)
     table = table.append_column("_bucket_start_ns", bucket_start_ns)
 
     # Aggregate high/low/volume + min/max ts per (symbol, bucket).
-    # We avoid ordered aggregations ("first"/"last") since they can be unsupported in some builds.
     gb = table.group_by(["symbol", "_bucket_start_ns"])
     agg = gb.aggregate(
         [
@@ -482,8 +405,7 @@ def build_bars_from_ohlcv_1s(
         ]
     ).rename_columns(["symbol", "_bucket_start_ns", "high", "low", "volume", "_ts_min", "_ts_max"])
 
-    # Lookup (symbol, ts_ns) -> open/close values (using the earliest and latest 1s rows in the bucket).
-    # For 1s bars, (symbol, ts_ns) is typically unique; if not, the sort above makes selection stable.
+    # Lookup (symbol, ts_ns) -> open/close values
     base = pa.table({"symbol": table["symbol"], "_ts_ns": table["_ts_ns"], "_open": table["open"], "_close": table["close"]})
     open_keys = pa.table({"symbol": agg["symbol"], "_ts_ns": agg["_ts_min"]})
     close_keys = pa.table({"symbol": agg["symbol"], "_ts_ns": agg["_ts_max"]})
@@ -544,10 +466,11 @@ def build_5m_bars_from_ohlcv_1s(
 
 def download_day(
     *,
-    day: str,                  # "YYYY-MM-DD" (treated as US/Eastern session date)
+    day: str,  # "YYYY-MM-DD" (treated as US/Eastern session date)
     symbols: Sequence[str],
     out_dir: str = "./databento_out",
     window: SessionWindow = SessionWindow(),
+    eq_dataset: str = "AUTO",
     download_trades: bool = True,
     download_ohlcv1s: bool = True,
     download_mbp10: bool = True,
@@ -557,42 +480,57 @@ def download_day(
     _ensure_dir(out)
 
     start, end = window.bounds(day)
-
     client = db.Historical()  # uses DATABENTO_API_KEY env var
 
-    # 1) Near-consolidated tape + bars
-    trades_path = out / f"EQUS.MINI.{day}.trades.parquet"
-    ohlcv1s_path = out / f"EQUS.MINI.{day}.ohlcv-1s.parquet"
+    # Choose the best dataset we can actually query under this account.
+    chosen_ds = _choose_eq_dataset(client, eq_dataset=eq_dataset, symbols=symbols, start=start, end=end)
+    if str(eq_dataset or "").strip().upper() == "AUTO":
+        print(f"[AUTO] Using eq dataset: {chosen_ds}")
+    eq_dataset = chosen_ds
+
+    # 1) Consolidated-ish tape + bars (dataset configurable; defaults to EQUS)
+    trades_path = out / f"{eq_dataset}.{day}.trades.parquet"
+    ohlcv1s_path = out / f"{eq_dataset}.{day}.ohlcv-1s.parquet"
 
     # 2) L2 depth (Nasdaq book)
     mbp10_path = out / f"XNAS.ITCH.{day}.mbp-10.parquet"
 
-    # 3) Build 10-second bars from 1-second OHLCV
-    bars10s_path = out / f"EQUS.MINI.{day}.ohlcv-10s.parquet"
-    bars1m_path = out / f"EQUS.MINI.{day}.ohlcv-1m.parquet"
-    bars5m_path = out / f"EQUS.MINI.{day}.ohlcv-5m.parquet"
+    # 3) Derived bars from 1-second OHLCV
+    bars10s_path = out / f"{eq_dataset}.{day}.ohlcv-10s.parquet"
+    bars1m_path = out / f"{eq_dataset}.{day}.ohlcv-1m.parquet"
+    bars5m_path = out / f"{eq_dataset}.{day}.ohlcv-5m.parquet"
+
     if download_trades:
-        fetch_trades_with_dataset_fallback(
+        fetch_to_parquet_incremental(
             client,
+            dataset=eq_dataset,
+            schema="trades",
             symbols=symbols,
             start=start,
             end=end,
-            out_path=trades_path,  # keep filename EQUS.MINI.<DAY>.trades.parquet regardless of dataset used
+            out_path=trades_path,
             overwrite=overwrite,
         )
+
     if download_ohlcv1s:
-        fetch_with_dataset_fallback(
-            client,
-            schema="ohlcv-1s",
-            symbols=symbols,
-            start=start,
-            end=end,
-            out_path=ohlcv1s_path,  # keep filename EQUS.MINI.<DAY>.ohlcv-1s.parquet regardless of dataset used
-            overwrite=overwrite,
-            dataset_priority=("XNAS.BASIC", "XNYS.PILLAR", "EDGX.PITCH", "EDGA.PITCH", "EQUS.MINI"),
-        )
+        try:
+            fetch_to_parquet_incremental(
+                client,
+                dataset=eq_dataset,
+                schema="ohlcv-1s",
+                symbols=symbols,
+                start=start,
+                end=end,
+                out_path=ohlcv1s_path,
+                overwrite=overwrite,
+            )
+        except Exception as e:
+            # Some datasets expose trades but not ohlcv-1s. Keep going; trades are the main point.
+            print(f"WARNING: failed to download ohlcv-1s from {eq_dataset}: {type(e).__name__}: {e}")
+            print("         You can still replay tape; consider building OHLCV from trades or using EQUS.MINI for OHLCV.")
+            download_ohlcv1s = False
+
         # Build derived bars (local resampling, no extra API usage).
-        # We only build bars for symbols that are missing in each derived file, then merge locally.
         existing_10s = _existing_symbols_in_parquet(bars10s_path) if bars10s_path.exists() else set()
         missing_10s = [s for s in symbols if s not in existing_10s] if not overwrite else list(symbols)
         existing_1m = _existing_symbols_in_parquet(bars1m_path) if bars1m_path.exists() else set()
@@ -622,8 +560,8 @@ def download_day(
                 tmp = td_path / f"{bars5m_path.stem}.new{bars5m_path.suffix}"
                 build_5m_bars_from_ohlcv_1s(ohlcv1s_path, tmp, tz=window.tz, symbols=missing_5m)
                 _merge_parquets_concat([bars5m_path, tmp], bars5m_path)
+
     if download_mbp10:
-        # Keep original behavior: MBP-10 always comes from the Nasdaq ITCH book.
         fetch_to_parquet_incremental(
             client,
             dataset="XNAS.ITCH",
@@ -648,39 +586,43 @@ def download_day(
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Download a window of Databento data to Parquet (safe for small tests).")
-    p.add_argument("--day", required=True, help="YYYY-MM-DD (session date, interpreted in America/New_York by default)")
-    p.add_argument("--symbols", required=True, nargs="+", help="One or more raw symbols (e.g. MNTS)")
+    p = argparse.ArgumentParser(description="Download a window of consolidated-ish Databento equities data to Parquet.")
+    p.add_argument("--day", required=True, help="YYYY-MM-DD (session date, interpreted in --tz by default)")
+    p.add_argument("--symbols", required=True, nargs="+", help="One or more raw symbols (e.g. ALMS)")
     p.add_argument("--out-dir", default="./databento_out")
     p.add_argument("--tz", default="America/New_York")
-    p.add_argument("--start-time", default="09:30:00", help="HH:MM:SS in --tz (e.g. 09:30:00)")
-    p.add_argument("--end-time", default="09:33:00", help="HH:MM:SS in --tz (e.g. 09:33:00 for a 3-min test)")
+    p.add_argument("--start-time", default="09:30:00", help="HH:MM:SS in --tz (e.g. 07:00:00)")
+    p.add_argument("--end-time", default="16:00:00", help="HH:MM:SS in --tz (e.g. 10:30:00)")
     p.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Force a full re-download (and rebuild derived bars) for the provided symbols, even if present in existing parquet files.",
+        "--eq-dataset",
+        default="AUTO",
+        help=(
+            "Databento equities dataset code to use for trades/ohlcv-1s. "
+            "Use AUTO (default) to probe and pick the first working dataset. "
+            "You may also provide a comma-separated list, e.g. 'EQUS.PLUS,XNAS.NLS,XCIS.TRADESBBO'."
+        ),
     )
+    p.add_argument("--overwrite", action="store_true", help="Force a full re-download for the provided symbols.")
     p.add_argument(
         "--build-derived-only",
         action="store_true",
-        help="Do NOT download anything. Only build 10s/1m/5m bars from an existing ohlcv-1s parquet in --out-dir.",
+        help="Do NOT download anything. Only build 10s/1m/5m bars from an existing <eq_dataset>.<day>.ohlcv-1s parquet.",
     )
-    p.add_argument("--skip-trades", action="store_true", help="Skip EQUS.MINI trades download")
-    p.add_argument("--skip-ohlcv1s", action="store_true", help="Skip EQUS.MINI ohlcv-1s download (and 10s aggregation)")
+    p.add_argument("--skip-trades", action="store_true", help="Skip trades download")
+    p.add_argument("--skip-ohlcv1s", action="store_true", help="Skip ohlcv-1s download (and derived bars)")
     p.add_argument("--skip-mbp10", action="store_true", help="Skip XNAS.ITCH mbp-10 download (saves credits)")
     args = p.parse_args()
 
     window = SessionWindow(start_time=args.start_time, end_time=args.end_time, tz=args.tz)
     out = Path(args.out_dir)
     if args.build_derived_only:
-        # Build from existing files; no API key required and no network calls.
-        ohlcv1s_path = out / f"EQUS.MINI.{args.day}.ohlcv-1s.parquet"
+        ohlcv1s_path = out / f"{args.eq_dataset}.{args.day}.ohlcv-1s.parquet"
         if not ohlcv1s_path.exists():
             raise FileNotFoundError(f"Missing {ohlcv1s_path}. Nothing to build from.")
 
-        bars10s_path = out / f"EQUS.MINI.{args.day}.ohlcv-10s.parquet"
-        bars1m_path = out / f"EQUS.MINI.{args.day}.ohlcv-1m.parquet"
-        bars5m_path = out / f"EQUS.MINI.{args.day}.ohlcv-5m.parquet"
+        bars10s_path = out / f"{args.eq_dataset}.{args.day}.ohlcv-10s.parquet"
+        bars1m_path = out / f"{args.eq_dataset}.{args.day}.ohlcv-1m.parquet"
+        bars5m_path = out / f"{args.eq_dataset}.{args.day}.ohlcv-5m.parquet"
 
         existing_10s = _existing_symbols_in_parquet(bars10s_path) if bars10s_path.exists() else set()
         missing_10s = [s for s in args.symbols if s not in existing_10s] if not args.overwrite else list(args.symbols)
@@ -728,8 +670,10 @@ if __name__ == "__main__":
             symbols=args.symbols,
             out_dir=args.out_dir,
             window=window,
+            eq_dataset=args.eq_dataset,
             download_trades=not args.skip_trades,
             download_ohlcv1s=not args.skip_ohlcv1s,
             download_mbp10=not args.skip_mbp10,
             overwrite=args.overwrite,
         )
+

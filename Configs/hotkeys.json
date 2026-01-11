@@ -16,9 +16,29 @@
         "args": {},
         "cmd": "das:c_365e5e4c367d4_19ba37f1bd9"
       },
+      "Shift+#": {
+        "args": {},
+        "cmd": "das:c_46c46227538fa_19ba394adc3"
+      },
+      "Shift+$": {
+        "args": {},
+        "cmd": "das:c_daee1fa420afc8_19ba394b104"
+      },
       "Shift+%": {
         "args": {},
         "cmd": "das:c_18e191e559a1b8_19ba38163f8"
+      },
+      "Shift+&": {
+        "args": {},
+        "cmd": "das:c_8a1a17c68ae22_19ba57d1a86"
+      },
+      "Shift+*": {
+        "args": {},
+        "cmd": "das:c_cfd17b261cd15_19ba93ff922"
+      },
+      "Shift+@": {
+        "args": {},
+        "cmd": "das:c_4e3a2e0b0c998_19ba394a966"
       },
       "Shift+A": {
         "args": {},
@@ -31,6 +51,10 @@
       "Shift+C": {
         "args": {},
         "cmd": "risk.cancel_all_orders"
+      },
+      "Shift+D": {
+        "args": {},
+        "cmd": "das:c_1b57a158f1e6f_19ba3946af6"
       },
       "Shift+F": {
         "args": {},
@@ -51,6 +75,14 @@
       "Shift+S": {
         "args": {},
         "cmd": "das:c_cf62d6176cf2f8_19ba382ad34"
+      },
+      "Shift+T": {
+        "args": {},
+        "cmd": "das:c_9d21097a66a97_19baafc706c"
+      },
+      "Shift+^": {
+        "args": {},
+        "cmd": "das:c_1177434f365c_19ba57cdb81"
       }
     },
     "l2": {},

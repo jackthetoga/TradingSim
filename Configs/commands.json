@@ -6,6 +6,36 @@
       "script": "lmtprice = ask+.01; shares=100;BUY;"
     },
     {
+      "id": "c_4e3a2e0b0c998_19ba394a966",
+      "name": "BuyAsk200",
+      "script": "lmtprice = ask+.01; shares=200;BUY;"
+    },
+    {
+      "id": "c_46c46227538fa_19ba394adc3",
+      "name": "BuyAsk300",
+      "script": "lmtprice = ask+.01; shares=300;BUY;"
+    },
+    {
+      "id": "c_daee1fa420afc8_19ba394b104",
+      "name": "BuyAsk400",
+      "script": "lmtprice = ask+.01; shares=400;BUY;"
+    },
+    {
+      "id": "c_1177434f365c_19ba57cdb81",
+      "name": "BuyAsk1000",
+      "script": "lmtprice = ask+.01; shares=1000;BUY;"
+    },
+    {
+      "id": "c_8a1a17c68ae22_19ba57d1a86",
+      "name": "BuyAsk2000",
+      "script": "lmtprice = ask+.01; shares=2000;BUY;"
+    },
+    {
+      "id": "c_cfd17b261cd15_19ba93ff922",
+      "name": "BuyAsk4000",
+      "script": "lmtprice = ask+.01; shares=4000;BUY;"
+    },
+    {
       "id": "c_dc136a66679b98_19ba3803bce",
       "name": "SellHalfAskMinus5",
       "script": "lmtprice = ask-.05; shares = position / 2; SELL;"
@@ -34,6 +64,16 @@
       "id": "c_cf62d6176cf2f8_19ba382ad34",
       "name": "SellHalfBid",
       "script": "lmtprice = bid; shares=position/2; SELL;"
+    },
+    {
+      "id": "c_1b57a158f1e6f_19ba3946af6",
+      "name": "SellQtrBid",
+      "script": "lmtprice = bid; shares=position/4; SELL;"
+    },
+    {
+      "id": "c_9d21097a66a97_19baafc706c",
+      "name": "SetMaxShares",
+      "script": "shares = BuyPower/ask;"
     }
   ],
   "version": 1
