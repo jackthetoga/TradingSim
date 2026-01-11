@@ -579,7 +579,12 @@ let sessionStats = { open: null, hi: null, lo: null, pcl: null }; // best-effort
 
 // ---------------- Simulator settings (disk-backed via Configs/settings.json) ----------------
 const SIM_SETTINGS_STORAGE_KEY = 'sim-settings-v1';
-const SIM_SETTINGS_DEFAULTS = { version: 1, allowShorting: false };
+const SIM_SETTINGS_DEFAULTS = {
+  version: 1,
+  allowShorting: false,
+  buyingPowerEnabled: true,
+  buyingPower: 1800,
+};
 let simSettings = null;
 
 function _normalizeSimSettings(obj){
@@ -587,6 +592,9 @@ function _normalizeSimSettings(obj){
   if (!obj || typeof obj !== 'object') return out;
   if (Number(obj.version || 0) !== 1) return out;
   out.allowShorting = !!obj.allowShorting;
+  out.buyingPowerEnabled = (obj.buyingPowerEnabled == null) ? out.buyingPowerEnabled : !!obj.buyingPowerEnabled;
+  const bp = Number(obj.buyingPower);
+  out.buyingPower = (Number.isFinite(bp) && bp >= 0) ? bp : out.buyingPower;
   return out;
 }
 
@@ -614,6 +622,17 @@ function _allowShorting(){
   return !!simSettings.allowShorting;
 }
 
+function _buyingPowerEnabled(){
+  if (!simSettings) simSettings = loadSimSettings();
+  return !!simSettings.buyingPowerEnabled;
+}
+
+function _buyingPower(){
+  if (!simSettings) simSettings = loadSimSettings();
+  const bp = Number(simSettings.buyingPower);
+  return (Number.isFinite(bp) && bp >= 0) ? bp : 0;
+}
+
 function _wouldGoShort(symbol, side, qty){
   const sym = String(symbol || '').toUpperCase();
   const s = String(side || '').toUpperCase();
@@ -624,6 +643,97 @@ function _wouldGoShort(symbol, side, qty){
   const sh = Number(pos?.shares ?? 0);
   if (!Number.isFinite(sh)) return true;
   return (sh - q) < 0;
+}
+
+function _currentAskPx(){
+  const a = Number(currentBook?.asks?.[0]?.[0]);
+  if (Number.isFinite(a) && a > 0) return a;
+  const lastPx = Number(lastTrade?.price);
+  if (Number.isFinite(lastPx) && lastPx > 0) return lastPx;
+  return null;
+}
+
+function _estimateBuyPxForOrder(orderType, limitPx, stopPx){
+  const t = String(orderType || '').toUpperCase();
+  if (t === 'LMT' || t === 'STOPLMT') {
+    const lim = Number(limitPx);
+    return (Number.isFinite(lim) && lim > 0) ? lim : null;
+  }
+  if (t === 'STOP') {
+    const stp = Number(stopPx);
+    return (Number.isFinite(stp) && stp > 0) ? stp : _currentAskPx();
+  }
+  // MKT and unknown: best-effort current ask/last
+  return _currentAskPx();
+}
+
+function _calcLongSharesAfterFill(prevShares, buyQty){
+  const prev = Number(prevShares || 0);
+  const q = Math.floor(Number(buyQty));
+  if (!Number.isFinite(prev) || !Number.isFinite(q)) return null;
+  const next = prev + q;
+  const curLong = Math.max(0, prev);
+  const nextLong = Math.max(0, next);
+  return { curLong, nextLong, deltaLong: Math.max(0, nextLong - curLong) };
+}
+
+function _openBuyNotional(sym){
+  // Conservative: sum remaining BUY order notional using their own limit/stop/current ask estimate.
+  const symbol = String(sym || '').toUpperCase();
+  if (!symbol) return 0;
+  let sum = 0;
+  for (const o of orders.values()){
+    if (!o) continue;
+    if (String(o.symbol).toUpperCase() !== symbol) continue;
+    if (o.status !== 'open' && o.status !== 'partial') continue;
+    if (o.cancelledAtNs != null) continue;
+    if (String(o.side).toUpperCase() !== 'BUY') continue;
+    const rem = _orderRemaining(o);
+    if (rem <= 0) continue;
+    const px = _estimateBuyPxForOrder(o.type, o.limitPx, o.stopPx);
+    if (px == null) continue;
+    sum += rem * px;
+  }
+  return Number.isFinite(sum) ? sum : 0;
+}
+
+function _longNotional(sym){
+  const symbol = String(sym || '').toUpperCase();
+  if (!symbol) return 0;
+  const pos = positions?.get?.(symbol);
+  const sh = Number(pos?.shares ?? 0);
+  if (!Number.isFinite(sh)) return 0;
+  const longSh = Math.max(0, sh);
+  if (longSh <= 0) return 0;
+  const px = _currentAskPx();
+  if (px == null) return 0;
+  return longSh * px;
+}
+
+function _wouldExceedBuyingPowerOnBuy({ symbol, qty, type, limitPx, stopPx }){
+  if (!_buyingPowerEnabled()) return { ok: true };
+  const sym = String(symbol || '').toUpperCase();
+  const q = Math.floor(Number(qty));
+  if (!sym || !Number.isFinite(q) || q <= 0) return { ok: true };
+
+  const pos = positions?.get?.(sym);
+  const prevSh = Number(pos?.shares ?? 0);
+  const shCalc = _calcLongSharesAfterFill(prevSh, q);
+  if (!shCalc) return { ok: true };
+  if (shCalc.deltaLong <= 0) return { ok: true }; // covering short or flat->less flat
+
+  const px = _estimateBuyPxForOrder(type, limitPx, stopPx);
+  if (px == null) return { ok: false, reason: 'Buying power check needs a price (book/last or limit/stop)' };
+
+  const curLong = _longNotional(sym);
+  const openBuys = _openBuyNotional(sym);
+  const add = shCalc.deltaLong * px;
+  const total = curLong + openBuys + add;
+  const bp = _buyingPower();
+  if (total > bp + 1e-9) {
+    return { ok: false, reason: `Buying power exceeded: est $${total.toFixed(2)} > limit $${bp.toFixed(2)}` };
+  }
+  return { ok: true };
 }
 
 // Perf: coalesce bursty SSE events into a single render per animation frame.
@@ -2560,6 +2670,7 @@ function _envSnapshot(){
       if (n === 'pcl') return (sessionStats?.pcl == null) ? null : Number(sessionStats.pcl);
       if (n === 'l2bid') return frozenBid;
       if (n === 'l2ask') return frozenAsk;
+      if (n === 'buypower') return _buyingPower();
       if (n === 'ticker') return getTicker();
       if (n === 'position') return getPosShares();
       if (n === 'pos') return getPosShares();
@@ -2922,6 +3033,24 @@ function makeSettingsHtml(){
             <div class="setHint">
               If disabled, any order that would take your position below 0 shares is rejected (including from hotkeys).
             </div>
+            <div style="height:14px;"></div>
+            <div style="height:1px; background: rgba(34,48,69,0.65);"></div>
+            <div style="height:14px;"></div>
+            <div style="color:var(--muted); font-size:12px; font-weight:900;">Buying Power</div>
+            <div style="height:10px;"></div>
+            <label class="hint" style="display:flex; align-items:center; gap:10px;">
+              <input type="checkbox" id="set-bp-enabled"/>
+              Enforce max long buying power
+            </label>
+            <div style="height:8px;"></div>
+            <label class="hint" style="display:flex; align-items:center; gap:10px;">
+              Max long ($)
+              <input id="set-bp" class="num" type="number" min="0" step="1" value="1800" style="width:120px;"/>
+            </label>
+            <div style="height:8px;"></div>
+            <div class="setHint">
+              When enabled, BUY orders that would increase net long exposure above this limit are rejected (uses best-effort estimates).
+            </div>
           </div>
         </div>
         <div class="setPane" id="set-pane-layout" style="display:none;">
@@ -2994,6 +3123,33 @@ function initSettingsWindow(){
         setStatus('Shorting enabled');
       }
     });
+
+    // Buying power controls
+    const bpOn = document.getElementById('set-bp-enabled');
+    const bpEl = document.getElementById('set-bp');
+    if (bpOn) bpOn.checked = !!simSettings.buyingPowerEnabled;
+    if (bpEl) bpEl.value = String(Number.isFinite(Number(simSettings.buyingPower)) ? Number(simSettings.buyingPower) : 1800);
+    const syncBpUi = ()=>{
+      const on = !!bpOn?.checked;
+      if (bpEl) bpEl.disabled = !on;
+      bpEl?.classList?.toggle?.('entryDisabled', !on);
+    };
+    syncBpUi();
+    bpOn?.addEventListener('change', ()=>{
+      if (!simSettings) simSettings = loadSimSettings();
+      simSettings.buyingPowerEnabled = !!bpOn.checked;
+      saveSimSettings();
+      syncBpUi();
+      setStatus(simSettings.buyingPowerEnabled ? 'Buying power limit enabled' : 'Buying power limit disabled');
+    });
+    bpEl?.addEventListener('change', ()=>{
+      if (!simSettings) simSettings = loadSimSettings();
+      const v = Number(bpEl.value);
+      simSettings.buyingPower = (Number.isFinite(v) && v >= 0) ? v : 1800;
+      bpEl.value = String(simSettings.buyingPower);
+      saveSimSettings();
+      setStatus(`Buying power set to $${Number(simSettings.buyingPower).toFixed(0)}`);
+    });
   } catch {}
   document.getElementById('layoutSaveAs')?.addEventListener('click', async (e)=>{
     e.preventDefault();
@@ -3035,7 +3191,7 @@ function makeCommandsHtml(){
           <span class="entryHint" id="cmdMsg"></span>
         </div>
         <div class="entryHint cmdFooter">
-          Vars: <span class="badge">ask</span> <span class="badge">bid</span> <span class="badge">shares</span> <span class="badge">ticker</span>
+          Vars: <span class="badge">ask</span> <span class="badge">bid</span> <span class="badge">shares</span> <span class="badge">ticker</span> <span class="badge">BuyPower</span>
           <span class="badge">position</span> <span class="badge">lmtprice</span> <span class="badge">stopprice</span> <span class="badge">costbasis</span>
           &nbsp; Commands: <span class="badge">BUY</span> <span class="badge">SELL</span> <span class="badge">CancelAll</span>
         </div>
@@ -3648,6 +3804,19 @@ function maybeTriggerStopsFromTrade(tr){
     const trig = (side === 'BUY') ? (px >= stopPx) : (px <= stopPx);
     if (!trig) continue;
 
+    // Buying power check at trigger-time for BUY stops/stop-limits (best-effort)
+    if (side === 'BUY') {
+      const rem = _orderRemaining(o);
+      const chk = _wouldExceedBuyingPowerOnBuy({ symbol: o.symbol, qty: rem, type: o.type, limitPx: o.limitPx, stopPx: o.stopPx });
+      if (!chk.ok) {
+        o.status = 'rejected';
+        orders.set(o.id, o);
+        renderOpenOrders();
+        setStatus(`Rejected ${o.id}: ${chk.reason || 'buying power exceeded'}`);
+        continue;
+      }
+    }
+
     // Enforce no-shorting at trigger time too (positions could have changed since placement).
     if (!_allowShorting() && side === 'SELL') {
       const rem = _orderRemaining(o);
@@ -3809,6 +3978,11 @@ function placeOrder({symbol, side, type, qty, limitPx, stopPx, route, tif, displ
   if (!Number.isFinite(q) || q <= 0) { setErr('Order: invalid qty'); return null; }
   if ((t === 'LMT' || t === 'STOPLMT') && (!Number.isFinite(lim) || lim == null || lim <= 0)) { setErr('Order: invalid limit price'); return null; }
   if ((t === 'STOP' || t === 'STOPLMT') && (!Number.isFinite(stp) || stp == null || stp <= 0)) { setErr('Order: invalid stop price'); return null; }
+
+  if (s === 'BUY') {
+    const chk = _wouldExceedBuyingPowerOnBuy({ symbol: sym, qty: q, type: t, limitPx: lim, stopPx: stp });
+    if (!chk.ok) { setErr(`Order: ${chk.reason || 'buying power exceeded'}`); return null; }
+  }
 
   if (!_allowShorting() && s === 'SELL') {
     if (_wouldGoShort(sym, 'SELL', q)) { setErr('Order: shorting disabled'); return null; }

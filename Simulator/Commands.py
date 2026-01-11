@@ -238,6 +238,7 @@ READ_VARS = {
     "pcl",
     "l2bid",
     "l2ask",
+    "buypower",
     "shares",
     "share",
     "ticker",
